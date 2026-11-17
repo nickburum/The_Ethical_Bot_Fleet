@@ -9,7 +9,7 @@ sentence the model can read and act on.
 
 import sys
 
-from ethical_bot_fleet import Blocked, FetchError, Fleet
+from ethical_bot_fleet import Blocked, FetchError, Fleet, readable
 
 fleet = Fleet(audit_log="audit.jsonl")
 # "ai-input" means: the page is read to answer a question, not to train a model.
@@ -29,7 +29,8 @@ TOOL = {
 
 def fetch_page(url: str, limit: int = 20_000) -> str:
     try:
-        return bot.get(url).text[:limit]
+        text = readable(bot.get(url))
+        return text if len(text) <= limit else text[:limit] + "\n[Truncated: first %d of %d characters.]" % (limit, len(text))
     except Blocked as no:
         return "Not fetched. %s Do not retry this URL." % no.decision.detail
     except FetchError as error:

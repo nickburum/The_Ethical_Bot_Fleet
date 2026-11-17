@@ -5,7 +5,11 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Dict, Iterator
+from typing import Callable, Dict, Iterator, Optional
+
+
+class BudgetExceeded(Exception):
+    """The per-host request limit was reached."""
 
 
 class _Host:
@@ -31,9 +35,11 @@ class HostLimiter:
             return self._hosts.setdefault(host, _Host())
 
     @contextmanager
-    def slot(self, host: str, delay: float) -> Iterator[None]:
+    def slot(self, host: str, delay: float, limit: Optional[int] = None) -> Iterator[None]:
         state = self._host(host)
         with state.lock:
+            if limit is not None and state.count >= limit:  # checked under the lock, so it cannot be raced
+                raise BudgetExceeded(host)
             wait = state.next_at - self._clock()
             if wait > 0:
                 self._sleep(wait)

@@ -6,10 +6,12 @@ never written to disk, logged, or sent anywhere except the provider you chose.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -91,10 +93,42 @@ def resolve(spec: Optional[str], base_url: Optional[str] = None) -> Tuple[Preset
     preset = PRESETS.get(name.lower())
     if preset is None:
         raise LLMError("Unknown model preset %r. Choices: %s." % (name, ", ".join(PRESETS)))
-    base = (base_url or os.environ.get("EBF_BASE_URL") or preset.base_url).rstrip("/")
+    # EBF_BASE_URL only moves local and custom servers; a cloud preset moves only with an explicit --base-url.
+    env_base = "" if (preset.base_url and not preset.local) else os.environ.get("EBF_BASE_URL", "")
+    base = (base_url or env_base or preset.base_url).rstrip("/")
+    if base and "://" not in base:
+        base = "http://" + base
     if preset.kind == "openai" and not base:
         raise LLMError("The custom preset needs a server address: --base-url http://host:port/v1 (or EBF_BASE_URL).")
     return preset, model or preset.default_model, base
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # A model server that redirects would carry the key and the question to a host nobody chose.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _opener(url: str) -> urllib.request.OpenerDirector:
+    handlers: List[Any] = [_NoRedirect]
+    if _is_loopback(urlsplit(url).hostname or ""):
+        handlers.append(urllib.request.ProxyHandler({}))  # a model on this machine is never reached through a proxy
+    return urllib.request.build_opener(*handlers)
+
+
+def _show(url: str) -> str:
+    """The address without any user:password part, for messages."""
+    parts = urlsplit(url)
+    return url.replace(parts.netloc, parts.netloc.rpartition("@")[2], 1) if "@" in parts.netloc else url
 
 
 def _http(url: str, payload: Optional[Dict[str, Any]], key: str, timeout: float) -> Dict[str, Any]:
@@ -104,19 +138,32 @@ def _http(url: str, payload: Optional[Dict[str, Any]], key: str, timeout: float)
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as handle:
-            return json.loads(handle.read().decode("utf-8"))
+        with _opener(url).open(request, timeout=timeout) as handle:
+            body = handle.read()
     except urllib.error.HTTPError as error:
         with error:
             detail = error.read().decode("utf-8", "replace")[:400]
-        raise LLMError("The model server returned HTTP %d: %s" % (error.code, detail), error.code)
+        if key:
+            detail = detail.replace(key, "[key hidden]")
+        if 300 <= error.code < 400:
+            raise LLMError("The model server at %s tried to redirect the request elsewhere; refusing to follow. "
+                           "Use its final address." % _show(url), error.code)
+        hint = " Check that the address ends in /v1." if error.code == 404 and "/v1" not in url else ""
+        raise LLMError("The model server returned HTTP %d: %s%s" % (error.code, detail, hint), error.code)
     except (OSError, ValueError) as error:
-        raise LLMError("Could not reach the model server at %s (%s)" % (url, error))
+        raise LLMError("Could not reach the model server at %s (%s)" % (_show(url), error))
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError:
+        raise LLMError("The model server at %s answered, but not with JSON. Is this the right address?" % _show(url))
 
 
 def list_models(base_url: str, key: str = "", timeout: float = 5.0) -> List[str]:
     data = _http(base_url + "/models", None, key, timeout)
-    return [item["id"] for item in data.get("data", []) if isinstance(item, dict) and item.get("id")]
+    items = data.get("data", []) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise LLMError("The server at %s does not look like a model server." % _show(base_url))
+    return [str(item["id"]) for item in items if isinstance(item, dict) and item.get("id")]
 
 
 def _openai_run(base: str, key: str, model: str, system: str, question: str,
@@ -143,18 +190,36 @@ def _openai_run(base: str, key: str, model: str, system: str, question: str,
             message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError):
             raise LLMError("The model server sent a reply this tool does not understand.")
+        if not isinstance(message, dict):
+            raise LLMError("The model server sent a reply this tool does not understand.")
         calls = message.get("tool_calls") or []
+        if not isinstance(calls, list):
+            calls = []
         if not calls:
-            return (message.get("content") or "").strip()
+            content = message.get("content")
+            if isinstance(content, list):  # some servers send the answer as a list of text parts
+                content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+            answer = content.strip() if isinstance(content, str) else ""
+            if not answer:
+                raise LLMError("The model returned an empty answer.")
+            return answer
         messages.append(message)
         for call in calls:
-            function = call.get("function") or {}
-            try:
-                arguments = json.loads(function.get("arguments") or "{}")
-                result = call_tool(function.get("name", ""), arguments if isinstance(arguments, dict) else {})
-            except ValueError:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict):
+                function = {}
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    arguments = None
+            if isinstance(arguments, dict):
+                result = call_tool(str(function.get("name", "")), arguments)
+            else:
                 result = "The tool arguments were not valid JSON."
-            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
+            call_id = call.get("id", "") if isinstance(call, dict) else ""
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
     raise LLMError("The model was still asking for pages after %d steps; stopping." % max_steps)
 
 
@@ -163,14 +228,17 @@ def fetch_text(bot: Bot, url: str, limit: int = PAGE_LIMIT) -> str:
     try:
         response = bot.get(url)
     except Blocked as no:
-        return "Not fetched: %s Do not retry this URL." % no.decision.detail
+        return "Not fetched: %s. Do not retry this URL." % no.decision.detail.rstrip(".")
     except FetchError as error:
         return "The request failed: %s" % error
     if not response.ok:
         return "The server answered HTTP %d for %s." % (response.status, url)
     text = readable(response)
+    cut = " The download itself was also cut off at %d bytes." % len(response.body) if response.truncated else ""
     if len(text) > limit:
-        text = text[:limit] + "\n\n[Page truncated: showing the first %d of %d characters.]" % (limit, len(text))
+        text = text[:limit] + "\n\n[Page truncated: showing the first %d of %d characters.%s]" % (limit, len(text), cut)
+    elif cut:
+        text += "\n\n[Page truncated.%s]" % cut
     return text
 
 
@@ -179,8 +247,15 @@ def ask(bot: Bot, question: str, urls: Iterable[str] = (), model: Optional[str] 
         on_event: Optional[Callable[[str], None]] = None) -> str:
     """Ask a model a question about the web. Every page it reads goes through the fleet."""
     preset, model_name, base = resolve(model, base_url)
+    if preset.kind == "claude" and base_url:
+        raise LLMError("The claude preset does not take --base-url. To use a gateway, set ANTHROPIC_BASE_URL instead.")
     notify = on_event or (lambda message: None)
-    key = os.environ.get(preset.key_env, "") if preset.key_env else ""
+    # A provider's key goes only to that provider's own address. Anywhere else gets EBF_API_KEY, if set.
+    if preset.key_env and (not preset.base_url or base == preset.base_url.rstrip("/")):
+        key = os.environ.get(preset.key_env, "")
+    else:
+        key = os.environ.get("EBF_API_KEY", "")
+    moved = bool(preset.base_url) and base != preset.base_url.rstrip("/")
 
     if preset.kind == "openai":
         if not model_name and (preset.local or not preset.base_url):
@@ -190,28 +265,39 @@ def ask(bot: Bot, question: str, urls: Iterable[str] = (), model: Optional[str] 
             model_name = available[0]
         if not model_name:
             raise LLMError("Name a model for %s, for example: --model %s:MODEL_NAME" % (preset.label, model or "custom"))
-        if preset.key_env and not key and not preset.local and preset.base_url:
+        if preset.key_env and not key and not preset.local and preset.base_url and not moved:
             raise LLMError("%s needs an API key in the %s environment variable." % (preset.label, preset.key_env))
 
     def call_tool(name: str, arguments: Dict[str, Any]) -> str:
         url = arguments.get("url")
         if name != "fetch_page" or not isinstance(url, str):
             return "Unknown tool call. The only tool is fetch_page(url)."
-        notify("reading " + url)
-        return fetch_text(bot, url)
+        return read(url)
 
-    parts = [question]
-    for url in urls:
+    def read(url: str) -> str:
         notify("reading " + url)
-        parts.append("Page %s:\n%s" % (url, fetch_text(bot, url)))
-    prompt = "\n\n".join(parts)
-    notify("asking %s (%s)" % (preset.label, model_name))
+        text = fetch_text(bot, url)
+        if text.startswith(("Not fetched:", "The request failed:", "The server answered")):
+            notify("  " + text.replace(" Do not retry this URL.", ""))
+        return text
 
     if preset.kind == "claude":
         from . import claude
 
-        return claude.run(model_name, SYSTEM, prompt, TOOL, call_tool, max_steps)
-    return _openai_run(base, key, model_name, SYSTEM, prompt, call_tool, max_steps)
+        claude.preflight()  # fail before reading any page if Claude cannot run
+
+    parts = [question]
+    for url in urls:
+        parts.append("Page %s:\n%s" % (url, read(url)))
+    prompt = "\n\n".join(parts)
+    notify("asking %s (%s)%s" % (preset.label, model_name, " at " + base if moved else ""))
+
+    try:
+        if preset.kind == "claude":
+            return claude.run(model_name, SYSTEM, prompt, TOOL, call_tool, max_steps)
+        return _openai_run(base, key, model_name, SYSTEM, prompt, call_tool, max_steps)
+    except (AttributeError, KeyError, IndexError, TypeError):
+        raise LLMError("The model server sent a reply this tool does not understand.") from None
 
 
 def status() -> List[Tuple[str, Preset, bool, str]]:
@@ -222,12 +308,18 @@ def status() -> List[Tuple[str, Preset, bool, str]]:
             try:
                 found = list_models(preset.base_url, timeout=0.5)
                 rows.append((name, preset, True, "running, %d model(s): %s" % (len(found), ", ".join(found[:3]) or "none loaded")))
-            except LLMError:
+            except Exception:  # anything odd on that port just means "no model server here"
                 rows.append((name, preset, False, "not running at %s" % preset.base_url))
         elif name == "custom":
             base = os.environ.get("EBF_BASE_URL", "")
             rows.append((name, preset, bool(base), "EBF_BASE_URL=%s" % base if base else "set EBF_BASE_URL or pass --base-url"))
         else:
             ready = bool(os.environ.get(preset.key_env))
-            rows.append((name, preset, ready, "%s is %s" % (preset.key_env, "set" if ready else "not set")))
+            note = "%s is %s" % (preset.key_env, "set" if ready else "not set")
+            if preset.kind == "claude":
+                try:
+                    import anthropic  # noqa: F401
+                except ImportError:
+                    ready, note = False, note + "; Anthropic SDK not installed (see docs/MODELS.md)"
+            rows.append((name, preset, ready, note))
     return rows

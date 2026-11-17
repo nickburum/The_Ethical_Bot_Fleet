@@ -25,6 +25,7 @@ class Handler(BaseHTTPRequestHandler):
 
     chats = []  # request bodies the "model" received
     tools_supported = True
+    odd = None  # a strange reply for /odd
 
     def log_message(self, *args):
         pass
@@ -40,6 +41,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/v1/models":
             return self._send(200, {"data": [{"id": "tiny-local-model"}]})
+        if self.path.startswith("/elsewhere"):
+            Handler.chats.append((self.path, dict(self.headers), None))
+            return self._send(200, {"data": [{"id": "stolen"}]})
         if self.path in SITE:
             return self._send(200, SITE[self.path], "text/html")
         self._send(404, b"gone", "text/plain")
@@ -48,6 +52,15 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         Handler.chats.append((self.path, dict(self.headers), body))
         base = "http://127.0.0.1:%d" % self.server.server_port
+        if self.path.startswith("/redirect/"):
+            self.send_response(302)
+            self.send_header("Location", base + "/elsewhere/chat/completions")
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
+        if self.path == "/echo/v1/chat/completions":
+            return self._send(401, {"error": "bad key: " + self.headers.get("Authorization", "")})
+        if self.path == "/odd/v1/chat/completions":
+            return self._send(200, {"choices": [{"message": Handler.odd}]})
         if self.path == "/v1/chat/completions":
             if "tools" in body and not Handler.tools_supported:
                 return self._send(400, {"error": "this model does not support tools"})
@@ -100,6 +113,10 @@ class TextTests(unittest.TestCase):
         text = html_to_text(SITE["/"].decode())
         self.assertEqual(text, "Tea Shop\n\nWelcome\n\nWe sell oolong.")
 
+    def test_unclosed_head_and_table_cells(self):
+        self.assertEqual(html_to_text("<html><head><title>T</title><body><p>BODY</p>"), "T\n\nBODY")
+        self.assertEqual(html_to_text("<table><tr><td>Basic</td><td>$5/month</td></tr></table>"), "Basic $5/month")
+
 
 class AskTests(Base):
     def test_local_model_is_detected_and_reads_through_the_fleet(self):
@@ -126,6 +143,53 @@ class AskTests(Base):
         path, headers, body = Handler.chats[0]
         self.assertEqual(headers["Authorization"], "Bearer sk-test-secret")
         self.assertNotIn("sk-test-secret", json.dumps(body))
+
+    def test_key_never_follows_a_redirect(self):
+        with mock.patch.dict(os.environ, {"EBF_API_KEY": "sk-test-secret"}):
+            with self.assertRaises(LLMError) as caught:
+                ask(self.bot, "hi", model="custom:m", base_url=self.base + "/redirect/v1")
+        self.assertIn("redirect", str(caught.exception))
+        self.assertFalse([c for c in Handler.chats if c[0].startswith("/elsewhere")])
+
+    def test_provider_key_only_goes_to_the_provider(self):
+        env = {"OPENAI_API_KEY": "sk-openai-secret", "EBF_BASE_URL": self.base + "/v1"}
+        with mock.patch.dict(os.environ, env):
+            ask(self.bot, "hi", model="openai:m", base_url=self.base + "/v1")  # explicitly moved: no provider key
+            self.assertNotIn("Authorization", Handler.chats[-1][1])
+            Handler.chats.clear()
+            with self.assertRaises(LLMError):  # EBF_BASE_URL alone must not move a cloud preset
+                ask(self.bot, "hi", model="openai:m")
+            self.assertEqual(Handler.chats, [])
+
+    def test_key_echoed_by_the_server_is_hidden(self):
+        with mock.patch.dict(os.environ, {"EBF_API_KEY": "sk-test-secret"}):
+            with self.assertRaises(LLMError) as caught:
+                ask(self.bot, "hi", model="custom:m", base_url=self.base + "/echo/v1")
+        self.assertNotIn("sk-test-secret", str(caught.exception))
+
+    def test_strange_replies_are_clean_errors(self):
+        for odd in (None, "text", {"content": 5}, {"content": None}, {"tool_calls": {"a": 1}},
+                    {"tool_calls": ["x"]}, {"tool_calls": [{"function": "f"}]}):
+            Handler.odd = odd
+            with self.assertRaises(LLMError, msg=repr(odd)):
+                ask(self.bot, "hi", model="custom:m", base_url=self.base + "/odd/v1", max_steps=2)
+        Handler.odd = {"content": [{"type": "text", "text": "in parts"}]}
+        self.assertEqual(ask(self.bot, "hi", model="custom:m", base_url=self.base + "/odd/v1"), "in parts")
+
+    def test_claude_refuses_base_url(self):
+        with self.assertRaises(LLMError) as caught:
+            ask(self.bot, "hi", model="claude", base_url=self.base)
+        self.assertIn("ANTHROPIC_BASE_URL", str(caught.exception))
+
+    def test_claude_without_credentials_is_a_clean_error(self):
+        try:
+            import anthropic  # noqa: F401
+        except ImportError:
+            self.skipTest("anthropic SDK not installed")
+        with mock.patch.dict(os.environ, {"HOME": "/nonexistent"}, clear=True):
+            with self.assertRaises(LLMError) as caught:
+                ask(self.bot, "hi", model="claude")
+        self.assertIn("ANTHROPIC_API_KEY", str(caught.exception))
 
     def test_helpful_errors(self):
         with mock.patch.dict(os.environ, {}, clear=True):

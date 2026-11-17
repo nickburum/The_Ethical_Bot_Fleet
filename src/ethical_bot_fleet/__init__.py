@@ -18,8 +18,9 @@ from .fleet import (  # noqa: E402
 from .llm import PRESETS, LLMError, ask  # noqa: E402
 from .robots import RobotsFile  # noqa: E402
 from .signals import PURPOSES  # noqa: E402
+from .text import html_to_text, readable  # noqa: E402
 
 __all__ = [
     "AuditLog", "ask", "Blocked", "Bot", "Decision", "FetchError", "Fleet", "FleetError", "IdentityError", "LLMError",
-    "Policy", "PRESETS", "PURPOSES", "Response", "Result", "RobotsFile", "verify_audit_log", "__version__",
+    "html_to_text", "Policy", "PRESETS", "PURPOSES", "readable", "Response", "Result", "RobotsFile", "verify_audit_log", "__version__",
 ]

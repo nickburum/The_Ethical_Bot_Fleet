@@ -6,7 +6,8 @@ import re
 from html.parser import HTMLParser
 from typing import List
 
-_SKIP = {"script", "style", "noscript", "template", "svg", "head"}
+_SKIP = {"script", "style", "noscript", "template", "svg"}
+_CELL = {"td", "th"}
 _BLOCK = {
     "p", "div", "br", "li", "ul", "ol", "tr", "table", "section", "article", "header", "footer",
     "nav", "aside", "main", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "hr", "form",
@@ -28,6 +29,8 @@ class _Text(HTMLParser):
             self._skip += 1
         elif tag in _BLOCK:
             self.parts.append("\n")
+        elif tag in _CELL:
+            self.parts.append("  ")
 
     def handle_endtag(self, tag):
         if tag == "title":
@@ -60,6 +63,10 @@ def html_to_text(html: str) -> str:
 def readable(response) -> str:
     """Plain text for a fleet ``Response``: HTML is stripped, other text is returned as is."""
     kind = response.headers.get("content-type", "").lower()
+    textual = not kind or kind.startswith("text/") or any(word in kind for word in ("json", "xml", "html", "javascript"))
+    if not textual or b"\x00" in response.body[:1024]:
+        return "[This is not a text page (%s, %d bytes), so there is nothing to read.]" % (
+            kind.split(";")[0] or "unknown type", len(response.body))
     if "html" in kind or (not kind and response.text.lstrip()[:1] == "<"):
         return html_to_text(response.text)
     return response.text

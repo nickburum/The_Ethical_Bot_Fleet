@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import email.utils
+import http.client
 import ipaddress
 import re
 import socket
@@ -11,23 +12,26 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 from . import __version__
 from .audit import AuditLog
-from .limiter import HostLimiter
+from .limiter import BudgetExceeded, HostLimiter
 from .robots import RobotsFile
-from .signals import PURPOSES, page_directives, violation
+from .signals import PURPOSES, decode, page_directives, violation
 from .transport import RawResponse, urllib_transport
 
 _TOKEN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,63}$")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # Names a bot may not use, because they belong to browsers or to someone else's crawler.
-_IMPERSONATION = (
-    "mozilla", "chrome", "chromium", "safari", "firefox", "edge", "opera", "applewebkit",
-    "googlebot", "bingbot", "gptbot", "claudebot", "ccbot", "duckduckbot", "yandex", "baiduspider",
-    "curl", "wget", "python-requests", "python-urllib",
+# Distinctive names are refused anywhere in the bot's name; short common words only at the start.
+_IMPERSONATION_ANYWHERE = (
+    "mozilla", "applewebkit", "googlebot", "bingbot", "gptbot", "claudebot", "duckduckbot",
+    "yandexbot", "baiduspider", "python-requests", "python-urllib",
 )
+_IMPERSONATION_WORD = re.compile(r"^(chrome|chromium|safari|firefox|edge|opera|curl|wget|ccbot|yandex)(bot)?([^a-z]|$)")
+# Errors the HTTP layer can raise: network failures and URLs it cannot send.
+_TRANSPORT_ERRORS = (OSError, http.client.HTTPException, ValueError)
 _ROBOTS_MAX_BYTES = 500 * 1024  # RFC 9309 asks parsers to handle at least 500 KiB
 _ROBOTS_MAX_TTL = 24 * 3600  # ...and not to cache for more than 24 hours
 
@@ -105,11 +109,7 @@ class Response:
 
     @property
     def text(self) -> str:
-        match = re.search(r"charset=([\w-]+)", self.headers.get("content-type", ""), re.I)
-        try:
-            return self.body.decode(match.group(1) if match else "utf-8", "replace")
-        except LookupError:
-            return self.body.decode("utf-8", "replace")
+        return decode(self.headers, self.body)
 
 
 @dataclass
@@ -127,6 +127,11 @@ class Result:
 
 def _domain_in(host: str, domains: Iterable[str]) -> bool:
     return any(host == d.lower() or host.endswith("." + d.lower()) for d in domains)
+
+
+def clean_url(url: str) -> str:
+    """Percent-encode spaces and non-ASCII characters so the URL can be sent."""
+    return quote(url.strip(), safe="%/:=&?~#+!$,;'@()*[]")
 
 
 def _origin(url: str) -> str:
@@ -158,9 +163,11 @@ class Bot:
     def __init__(self, fleet: "Fleet", name: str, contact: str, purpose: str, version: str):
         if not _TOKEN.match(name):
             raise IdentityError("bot name must be a single token such as 'AcmeResearchBot', got %r" % name)
-        if any(word in name.lower() for word in _IMPERSONATION):
+        lowered = name.lower()
+        if any(word in lowered for word in _IMPERSONATION_ANYWHERE) or _IMPERSONATION_WORD.match(lowered):
             raise IdentityError("bot name %r imitates a browser or another crawler; pick your own name" % name)
-        if not (contact.startswith(("https://", "http://")) or _EMAIL.match(contact)):
+        is_url = contact.startswith(("https://", "http://")) and "." in (urlsplit(contact).hostname or "")
+        if not (is_url or _EMAIL.match(contact)):
             raise IdentityError("contact must be a URL or an email address where site owners can reach you")
         if purpose not in PURPOSES:
             raise IdentityError("purpose must be one of %s, got %r" % (", ".join(PURPOSES), purpose))
@@ -175,11 +182,11 @@ class Bot:
 
     def check(self, url: str) -> Decision:
         """Ask whether this bot may fetch ``url``. Reads robots.txt, never the page."""
-        return self.fleet._check(self, url)
+        return self.fleet._check(self, clean_url(url))
 
     def get(self, url: str) -> Response:
         """Fetch ``url``, or raise ``Blocked`` / ``FetchError``."""
-        return self.fleet._get(self, url)
+        return self.fleet._get(self, clean_url(url))
 
     def crawl(self, urls: Iterable[str], workers: int = 8) -> Iterator[Result]:
         """Fetch many URLs concurrently, yielding results as they finish."""
@@ -240,7 +247,11 @@ class Fleet:
             if cached and cached[0] > self._clock():
                 return cached[1]
             parsed = self._fetch_robots(bot, origin)
+            # The robots.txt request counts as a visit: the first page waits its turn after it.
+            self._limiter.penalize(origin, self.policy.min_delay)
             ttl = min(self.policy.robots_ttl, _ROBOTS_MAX_TTL)
+            if parsed.mode in ("disallow_all", "unreachable"):
+                ttl = min(ttl, 60.0)  # look again soon; the site may just be having a bad minute
             self._robots[origin] = (self._clock() + ttl, parsed)
             return parsed
 
@@ -259,8 +270,8 @@ class Fleet:
                 break
             else:
                 return RobotsFile.disallow_all("robots.txt redirected too many times")
-        except OSError as error:
-            return RobotsFile.disallow_all("robots.txt unreachable (%s)" % error)
+        except _TRANSPORT_ERRORS as error:
+            return RobotsFile.unreachable("could not connect to %s (%s)" % (urlsplit(origin).hostname, error))
         if 200 <= raw.status < 300:
             return RobotsFile.parse(raw.body.decode("utf-8", "replace"))
         if raw.status == 429 or raw.status >= 500:
@@ -293,13 +304,19 @@ class Fleet:
 
     def _decide(self, bot: Bot, url: str) -> Decision:
         policy = self.policy
-        parts = urlsplit(url)
-        host = (parts.hostname or "").lower()
 
         def no(reason: str, detail: str, rule: Optional[str] = None) -> Decision:
             return Decision(False, url, reason, detail, rule)
 
-        if parts.scheme not in ("http", "https") or not host:
+        try:
+            parts = urlsplit(url)
+            parts.port  # raises ValueError for a port that is not a number
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            return no("bad_url", "this is not a valid URL")
+        if "://" not in url:
+            return no("bad_url", "the address needs to start with https:// (did you mean https://%s ?)" % url)
+        if parts.scheme not in ("http", "https") or not host or any(c.isspace() or ord(c) < 32 for c in url):
             return no("bad_url", "only http and https URLs can be fetched")
         if parts.username or parts.password:
             return no("bad_url", "URLs with embedded credentials are not fetched")
@@ -320,6 +337,8 @@ class Fleet:
         verdict = robots.evaluate(bot.name, url)
         rule = str(verdict.rule) if verdict.rule else None
         if not verdict.allowed:
+            if robots.mode == "unreachable":
+                return no("site_unreachable", verdict.note)
             if robots.mode == "disallow_all":
                 return no("robots_unreachable", verdict.note + "; treating the site as off limits")
             return no("robots_disallow", "robots.txt disallows this path for %s" % bot.name, rule)
@@ -380,9 +399,16 @@ class Fleet:
         attempt = 0
         while True:
             try:
-                with self._limiter.slot(host, delay):
+                with self._limiter.slot(host, delay, policy.max_requests_per_host):
                     raw = self._transport(url, {"User-Agent": bot.user_agent}, policy.timeout, policy.max_bytes)
-            except OSError as error:
+            except BudgetExceeded:
+                blocked = Decision(
+                    False, url, "host_budget",
+                    "this fleet already made %d requests to %s" % (policy.max_requests_per_host, urlsplit(url).hostname),
+                )
+                self.audit.write("block", bot=bot.name, purpose=bot.purpose, url=url, reason=blocked.reason, detail=blocked.detail)
+                raise Blocked(blocked)
+            except _TRANSPORT_ERRORS as error:
                 self.audit.write("error", bot=bot.name, purpose=bot.purpose, url=url, detail=str(error))
                 raise FetchError("%s: %s" % (url, error)) from error
             if raw.status not in (429, 503) or attempt >= policy.max_retries:

@@ -102,7 +102,7 @@ class RobotsFile:
     def __init__(self, groups: Dict[str, Group], sitemaps: List[str], mode: str = "parsed", note: str = ""):
         self.groups = groups
         self.sitemaps = sitemaps
-        self.mode = mode  # "parsed" | "allow_all" | "disallow_all"
+        self.mode = mode  # "parsed" | "allow_all" | "disallow_all" | "unreachable"
         self.note = note
 
     @classmethod
@@ -112,6 +112,11 @@ class RobotsFile:
     @classmethod
     def disallow_all(cls, note: str = "") -> "RobotsFile":
         return cls({}, [], "disallow_all", note)
+
+    @classmethod
+    def unreachable(cls, note: str = "") -> "RobotsFile":
+        """The site could not be contacted at all, so nothing may be fetched."""
+        return cls({}, [], "unreachable", note)
 
     @classmethod
     def parse(cls, text: str) -> "RobotsFile":
@@ -167,7 +172,7 @@ class RobotsFile:
             path += "?" + normalize_path(parts.query)
         if path == "/robots.txt" or self.mode == "allow_all":
             return Verdict(True, note=self.note)
-        if self.mode == "disallow_all":
+        if self.mode in ("disallow_all", "unreachable"):
             return Verdict(False, note=self.note)
         group = self.group_for(agent)
         if group is None:

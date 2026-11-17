@@ -64,7 +64,14 @@ A different port or another machine on your network works the same way with any 
 ebf ask "What is this page about?" https://example.com/ --model ollama --base-url http://192.168.1.20:11434/v1
 ```
 
-If the server needs a key, put it in `EBF_API_KEY`.
+If the server needs a key, put it in `EBF_API_KEY`. That key is sent to any server you point at with
+`--base-url`. A cloud provider's own key (such as `OPENAI_API_KEY`) is only ever sent to that provider's
+real address, never to an address you override.
+
+To avoid typing the address each time, set `EBF_BASE_URL`. It applies to the local and `custom` presets
+only; it never redirects a cloud preset.
+
+A model on this machine (`localhost`) is always contacted directly, even if your system uses a proxy.
 
 ### Models that cannot use tools
 
@@ -113,6 +120,9 @@ The default is `claude-opus-5-5`. To pick another, for example the faster and ch
 ebf ask "Summarise this page" https://example.com/ --model claude:claude-haiku-5-5
 ```
 
+The `claude` preset does not take `--base-url`; to go through a gateway, set `ANTHROPIC_BASE_URL`, which
+the SDK reads itself.
+
 If a request is declined by a safety check on the default model, Anthropic's server-side fallback lets
 another Claude model answer in the same call.
 
@@ -142,4 +152,6 @@ print(ask(bot, "What is this page about?", ["https://example.com/"], model="olla
 | `has no models loaded yet` | download or load a model in the local app |
 | `needs an API key in the ... environment variable` | export that variable |
 | `Name a model for ...` | use `--model NAME:MODEL_ID` |
+| `HTTP 404` from the model server | the address usually needs to end in `/v1` |
+| `tried to redirect the request elsewhere` | use the server's final address; redirects are refused so keys cannot leak |
 | `Not fetched: ...` in the answer | the site does not allow it; that is the fleet working |

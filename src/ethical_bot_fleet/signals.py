@@ -7,13 +7,31 @@ before the body is handed to the caller.
 
 from __future__ import annotations
 
+import re
 from html.parser import HTMLParser
 from typing import Dict, Optional, Set
 
 PURPOSES = ("search", "ai-input", "ai-train", "other")
 AI_PURPOSES = ("ai-input", "ai-train")
 
-_SCAN_BYTES = 256 * 1024
+_NOT_MARKUP = ("image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/octet-stream")
+
+
+def decode(headers: Dict[str, str], body: bytes) -> str:
+    """Decode a page using the header charset, a byte-order mark, a <meta charset>, or UTF-8."""
+    match = re.search(r"charset=[\"']?([\w.:-]+)", headers.get("content-type", ""), re.I)
+    names = [match.group(1)] if match else []
+    if body[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        names.append("utf-16")
+    declared = re.search(rb"<meta[^>]{0,200}charset=[\"']?([\w.:-]+)", body[:4096], re.I)
+    if declared:
+        names.append(declared.group(1).decode("ascii", "replace"))
+    for name in names + ["utf-8"]:
+        try:
+            return body.decode(name, "replace")
+        except LookupError:
+            continue
+    return body.decode("utf-8", "replace")
 
 
 class _MetaScanner(HTMLParser):
@@ -57,13 +75,16 @@ def page_directives(headers: Dict[str, str], body: bytes, agent: str) -> Set[str
     found = _header_directives(headers.get("x-robots-tag", ""), agent)
     if headers.get("tdm-reservation", "").strip() == "1":
         found.add("tdm-reservation")
-    if "html" in headers.get("content-type", "").lower():
-        scanner = _MetaScanner(agent)
-        try:
-            scanner.feed(body[:_SCAN_BYTES].decode("utf-8", "replace"))
-        except Exception:  # malformed markup must never crash a crawl
-            pass
-        found |= scanner.directives
+    kind = headers.get("content-type", "").lower()
+    if not kind.startswith(_NOT_MARKUP):  # scan anything that could be a page, even if mislabelled
+        text = decode(headers, body)
+        if "<meta" in text.lower():
+            scanner = _MetaScanner(agent)
+            try:
+                scanner.feed(text)
+            except Exception:  # malformed markup must never crash a crawl
+                pass
+            found |= scanner.directives
     return found
 
 

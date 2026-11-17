@@ -57,6 +57,29 @@ class CliTests(unittest.TestCase):
         self.assertIn("ALLOW  " + self.base + "/\n", out)
         self.assertIn("rule: Disallow: /private/ (line 2)", out)
 
+    def test_links_handles_placeholders_brackets_and_dead_hosts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            readme = os.path.join(folder, "README.md")
+            with open(readme, "w") as handle:
+                handle.write("(see %s/wiki_(page)) and http://host:port/v1 and http://127.0.0.1:9/dead\n" % self.base)
+            code, out = self.run_cli("links", "-v", "--allow-private", "--delay", "0", readme)
+            self.assertEqual(code, 1)
+            self.assertIn("%s/wiki_(page)  (404)" % self.base, out)
+            self.assertIn("BROKEN   http://host:port/v1", out)
+            self.assertIn("BROKEN   http://127.0.0.1:9/dead", out)
+            self.assertIn("3 links: 0 ok, 3 broken, 0 skipped", out)
+
+    def test_bad_input_never_shows_a_traceback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            junk = os.path.join(folder, "junk.txt")
+            with open(junk, "w") as handle:
+                handle.write("hello\n")
+            self.assertEqual(self.run_cli("audit", "summary", junk)[0], 1)
+            self.assertEqual(self.run_cli("audit", "verify", junk)[0], 1)
+            self.assertEqual(self.run_cli("check", "--audit-log", junk, self.base + "/")[0], 1)
+        self.assertEqual(self.run_cli("read", "--allow-private", self.base + "/a b\u00e9")[0], 1)  # a clean 404
+        self.assertEqual(self.run_cli("check", "http://host:port/")[0], 3)
+
     def test_links_and_audit(self):
         with tempfile.TemporaryDirectory() as folder:
             readme, log = os.path.join(folder, "README.md"), os.path.join(folder, "audit.jsonl")

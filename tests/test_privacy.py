@@ -38,8 +38,8 @@ class PrivacyTests(unittest.TestCase):
         for name in os.listdir(package):
             if name.endswith(".py"):
                 with open(os.path.join(package, name), encoding="utf-8") as handle:
-                    found |= set(re.findall(r"https?://([A-Za-z0-9.-]+)", handle.read()))
-        found -= {"host", "example.com"}  # placeholders in help text
+                    found |= {h.rstrip(".") for h in re.findall(r"https?://([A-Za-z0-9.-]+)", handle.read())}
+        found -= {"host", "example.com", "%s", ""}  # placeholders in help text
         self.assertEqual(found - allowed, set())
 
 

@@ -17,7 +17,8 @@ from .signals import PURPOSES
 
 PROJECT_URL = "https://github.com/nickburum/The_Ethical_Bot_Fleet"
 EXIT_BLOCKED = 3
-_LINK = re.compile(r"https?://[^\s<>\"'`)\]]+")
+_LINK = re.compile(r"https?://[^\s<>\"'`\]]+")
+_HINTS = {"private_network": "add --allow-private if you really mean to reach this address"}
 
 EPILOG = """\
 examples:
@@ -29,6 +30,23 @@ examples:
 
 privacy: no accounts, no telemetry, nothing stored unless you pass --audit-log.
 """
+
+
+def _url(value: str) -> str:
+    """Let people type example.com instead of https://example.com."""
+    return value if "://" in value else "https://" + value
+
+
+def _hint(decision) -> None:
+    if decision.reason in _HINTS:
+        print("       hint: %s" % _HINTS[decision.reason], file=sys.stderr)
+
+
+def _trim(link: str) -> str:
+    link = link.rstrip(".,;:!?")
+    while link.endswith(")") and link.count(")") > link.count("("):
+        link = link[:-1].rstrip(".,;:!?")
+    return link
 
 
 def _bot(args: argparse.Namespace, purpose: Optional[str] = None):
@@ -49,7 +67,7 @@ def _options(parser: argparse.ArgumentParser, purpose: str = "other") -> None:
 def _check(args: argparse.Namespace) -> int:
     bot = _bot(args)
     worst = 0
-    for url in args.url:
+    for url in map(_url, args.url):
         decision = bot.check(url)
         if args.json:
             print(json.dumps(decision.__dict__, sort_keys=True))
@@ -61,6 +79,7 @@ def _check(args: argparse.Namespace) -> int:
             if decision.crawl_delay:
                 print("       crawl-delay: %gs" % decision.crawl_delay)
         if not decision.allowed:
+            _hint(decision)
             worst = EXIT_BLOCKED
     return worst
 
@@ -70,19 +89,24 @@ def _get(args: argparse.Namespace, as_text: bool) -> int:
 
     bot = _bot(args)
     worst = 0
-    for url in args.url:
+    for url in map(_url, args.url):
         try:
             response = bot.get(url)
         except Blocked as error:
             print("BLOCK  %s\n       %s" % (url, error), file=sys.stderr)
+            _hint(error.decision)
             worst = EXIT_BLOCKED
             continue
         except FleetError as error:
             print("ERROR  %s" % error, file=sys.stderr)
             worst = worst or 1
             continue
-        print("%d  %s  (%d bytes)" % (response.status, response.url, len(response.body)), file=sys.stderr)
-        if as_text:
+        print("%d  %s  (%d bytes%s)" % (
+            response.status, response.url, len(response.body),
+            ", cut off at the size limit" if response.truncated else ""), file=sys.stderr)
+        if as_text and not response.ok:
+            print("       the server answered with an error page; not printed", file=sys.stderr)
+        elif as_text:
             print(readable(response))
         else:
             sys.stdout.flush()
@@ -101,13 +125,16 @@ def _links(args: argparse.Namespace) -> int:
         else:
             with open(source, "r", encoding="utf-8", errors="replace") as handle:
                 text = handle.read()
-        urls += [match.rstrip(".,;:!?") for match in _LINK.findall(text)]
+        urls += [_trim(match) for match in _LINK.findall(text)]
     urls = list(dict.fromkeys(urls))
     broken = skipped = 0
     for result in bot.crawl(urls, workers=args.workers):
         if result.response is not None and result.response.status < 400:
             if args.verbose:
                 print("ok       %d  %s" % (result.response.status, result.url))
+        elif result.blocked and result.error.decision.reason in ("site_unreachable", "bad_url"):
+            broken += 1
+            print("BROKEN   %s  (%s)" % (result.url, result.error.decision.detail))
         elif result.blocked:
             skipped += 1
             print("skipped       %s  (%s)" % (result.url, result.error.decision.reason))
@@ -123,8 +150,11 @@ def _links(args: argparse.Namespace) -> int:
 def _ask(args: argparse.Namespace) -> int:
     from .llm import ask
 
+    question, urls = args.question, list(args.url)
+    if question.startswith(("http://", "https://")) and urls and " " in urls[-1]:
+        question, urls = urls[-1], [question] + urls[:-1]  # the question and a URL were typed the other way round
     answer = ask(
-        _bot(args), args.question, args.url, model=args.model, base_url=args.base_url,
+        _bot(args), question, [_url(u) for u in urls], model=args.model, base_url=args.base_url,
         on_event=lambda message: print("· " + message, file=sys.stderr),
     )
     print(answer)
@@ -145,7 +175,7 @@ def _models(args: argparse.Namespace) -> int:
 
 
 def _audit_verify(args: argparse.Namespace) -> int:
-    ok, count, message = verify(args.file)
+    ok, count, message = verify(args.file, args.head)
     print("%s  %d records, %s" % ("OK    " if ok else "BROKEN", count, message))
     return 0 if ok else 1
 
@@ -218,6 +248,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         sub = audit.add_parser(name, help=text)
         sub.add_argument("file")
+        if name == "verify":
+            sub.add_argument("--head", metavar="HASH", help="the last record's hash from an earlier verify; "
+                             "detects records removed from the end")
         sub.set_defaults(run=run)
 
     args = parser.parse_args(argv)
@@ -226,7 +259,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except FleetError as error:
         print("error: %s" % error, file=sys.stderr)
         return 2
-    except OSError as error:
+    except (OSError, ValueError) as error:
         print("error: %s" % error, file=sys.stderr)
         return 1
     except KeyboardInterrupt:

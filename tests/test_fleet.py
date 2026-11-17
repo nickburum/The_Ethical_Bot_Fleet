@@ -62,12 +62,21 @@ class IdentityTests(unittest.TestCase):
         for name, contact, purpose in (
             ("Mozilla", "https://a.example", "other"),
             ("MyGooglebot", "https://a.example", "other"),
+            ("Chrome", "https://a.example", "other"),
+            ("curl-8", "https://a.example", "other"),
             ("Acme Bot", "https://a.example", "other"),
             ("AcmeBot", "nobody", "other"),
             ("AcmeBot", "https://a.example", "world-domination"),
         ):
             with self.assertRaises(IdentityError):
                 fleet.bot(name, contact, purpose)
+
+    def test_innocent_names_are_accepted(self):
+        fleet, _, _ = make({})
+        for name in ("KnowledgeBot", "OperationsBot", "LedgerBot", "ParkGuideBot"):
+            fleet.bot(name, "https://a.example")
+        with self.assertRaises(IdentityError):
+            fleet.bot("AcmeBot", "http://")
 
     def test_email_contact_is_accepted(self):
         fleet, _, _ = make({})
@@ -103,6 +112,21 @@ class DecisionTests(unittest.TestCase):
         for url in ("ftp://site.example/", "file:///etc/passwd", "https://user:pw@site.example/"):
             self.assertEqual(self.bot.check(url).reason, "bad_url")
 
+    def test_malformed_urls_are_refused_not_crashed_on(self):
+        for url in ("http://host:port/v1", "example.com", "http://[bad/"):
+            self.assertEqual(self.bot.check(url).reason, "bad_url", url)
+        self.assertIn("https://example.com", self.bot.check("example.com").detail)
+
+    def test_spaces_and_accents_are_encoded(self):
+        self.web.pages["https://site.example/caf%C3%A9%20menu"] = (200, HTML, b"ok")
+        self.assertEqual(self.bot.get("https://site.example/caf\u00e9 menu").body, b"ok")
+
+    def test_transport_rejecting_a_url_is_a_fetch_error(self):
+        import http.client
+        self.web.pages["https://site.example/odd"] = http.client.InvalidURL("nope")
+        with self.assertRaises(FetchError):
+            self.bot.get("https://site.example/odd")
+
     def test_check_does_not_fetch_the_page(self):
         self.assertTrue(self.bot.check("https://site.example/"))
         self.assertEqual([u for u, _ in self.web.requests], ["https://site.example/robots.txt"])
@@ -117,9 +141,9 @@ class RobotsAvailabilityTests(unittest.TestCase):
         fleet, _, _ = make({"https://a.example/robots.txt": (503, {}, b"")})
         self.assertEqual(fleet.bot("AcmeBot", "https://a.example").check("https://a.example/").reason, "robots_unreachable")
 
-    def test_network_failure_on_robots_means_off_limits(self):
+    def test_dead_site_is_reported_as_unreachable_not_as_a_refusal(self):
         fleet, _, _ = make({"https://a.example/robots.txt": OSError("connection refused")})
-        self.assertEqual(fleet.bot("AcmeBot", "https://a.example").check("https://a.example/").reason, "robots_unreachable")
+        self.assertEqual(fleet.bot("AcmeBot", "https://a.example").check("https://a.example/").reason, "site_unreachable")
 
     def test_robots_redirect_is_followed(self):
         fleet, _, _ = make({
@@ -165,6 +189,14 @@ class PolicyTests(unittest.TestCase):
             bot.get("https://a.example/2")
         self.assertEqual(caught.exception.decision.reason, "host_budget")
 
+    def test_host_budget_holds_under_concurrency(self):
+        pages = {"https://a.example/%d" % i: (200, {}, b"x") for i in range(40)}
+        fleet, web, _ = make(pages, max_requests_per_host=5, min_delay=0)
+        results = list(fleet.bot("AcmeBot", "https://a.example").crawl(pages, workers=16))
+        self.assertEqual(sum(1 for r in results if r.response), 5)
+        self.assertEqual(sum(1 for r in results if r.blocked), 35)
+        self.assertEqual(len([u for u, _ in web.requests if not u.endswith("robots.txt")]), 5)
+
     def test_excessive_crawl_delay_skips_the_host(self):
         fleet, _, _ = make({"https://a.example/robots.txt": (200, {}, b"User-agent: *\nCrawl-delay: 600\n")})
         self.assertEqual(fleet.bot("AcmeBot", "https://a.example").check("https://a.example/").reason, "crawl_delay_too_long")
@@ -181,24 +213,25 @@ class PolitenessTests(unittest.TestCase):
         one = fleet.bot("AcmeBot", "https://a.example")
         two = fleet.bot("OtherBot", "https://a.example")
         one.get("https://site.example/a")
-        two.get("https://other.example/")  # a different host does not wait
-        self.assertEqual(clock.sleeps, [])
+        two.get("https://other.example/")  # a different host does not wait for site.example
+        # each first page waits one polite second after that site's robots.txt request
+        self.assertEqual(clock.sleeps, [1.0, 1.0])
         two.get("https://site.example/b")  # the same host waits for Crawl-delay: 3
-        self.assertEqual(clock.sleeps, [3.0])
+        self.assertEqual(clock.sleeps, [1.0, 1.0, 2.0])  # 3 seconds after the last request to that host
 
     def test_retry_after_is_honoured(self):
         fleet, web, clock = make({
             "https://a.example/": [(429, {"retry-after": "7"}, b""), (200, {}, b"ok")],
         })
         self.assertEqual(fleet.bot("AcmeBot", "https://a.example").get("https://a.example/").body, b"ok")
-        self.assertEqual(clock.sleeps, [7.0])
+        self.assertEqual(clock.sleeps, [1.0, 7.0])
 
     def test_long_retry_after_backs_off(self):
         fleet, web, clock = make({"https://a.example/": (503, {"retry-after": "86400"}, b"")})
         with self.assertRaises(Blocked) as caught:
             fleet.bot("AcmeBot", "https://a.example").get("https://a.example/")
         self.assertEqual(caught.exception.decision.reason, "retry_after_too_long")
-        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(clock.sleeps, [1.0])
 
     def test_retries_are_bounded(self):
         fleet, web, _ = make({"https://a.example/": (503, {}, b"")}, max_retries=2)
@@ -273,6 +306,19 @@ class AiSignalTests(unittest.TestCase):
             self.bot("ai-train")[0].get("https://b.example/tdm")
         self.assertTrue(self.bot("ai-input")[0].get("https://b.example/tdm").ok)
 
+    def test_noai_meta_is_found_however_the_page_is_served(self):
+        tag = '<html><head><meta name="robots" content="noai"></head><body>text</body></html>'
+        pages = {
+            "https://b.example/no-type": (200, {}, tag.encode()),
+            "https://b.example/utf16": (200, {"content-type": "text/html; charset=utf-16"}, tag.encode("utf-16")),
+            "https://b.example/late": (200, HTML, b"<html><body>" + b"<p>filler</p>" * 40000 + tag.encode()),
+            "https://b.example/xml": (200, {"content-type": "application/xhtml+xml"}, tag.encode()),
+        }
+        for url in pages:
+            fleet, _, _ = make(dict(pages), min_delay=0)
+            with self.assertRaises(Blocked, msg=url):
+                fleet.bot("AcmeBot", "https://a.example", "ai-input").get(url)
+
     def test_agent_scoped_header(self):
         self.assertTrue(self.bot("ai-train")[0].get("https://b.example/scoped").ok)
         with self.assertRaises(Blocked):
@@ -324,6 +370,27 @@ class AuditTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as handle:
                 handle.writelines(lines[:1] + lines[2:])
             self.assertFalse(verify_audit_log(path)[0])
+
+            # Cutting records off the end leaves a valid chain; the saved last hash catches it.
+            head = json.loads(lines[-1])["hash"]
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.writelines(lines)
+            self.assertTrue(verify_audit_log(path, head)[0])
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.writelines(lines[:-2])
+            self.assertTrue(verify_audit_log(path)[0])
+            self.assertFalse(verify_audit_log(path, head)[0])
+            if os.name == "posix":
+                self.assertEqual(os.stat(path).st_mode & 0o077, 0)
+
+    def test_damaged_logs_give_clear_errors(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "audit.jsonl")
+            with open(path, "w") as handle:
+                handle.write("[1, 2]\nnot json\n")
+            self.assertFalse(verify_audit_log(path)[0])
+            with self.assertRaises(ValueError):
+                Fleet(audit_log=path)
 
 
 if __name__ == "__main__":

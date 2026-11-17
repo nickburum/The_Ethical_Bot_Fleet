@@ -95,14 +95,14 @@ print(ask(bot, "What is this about?", ["https://example.com/article"], model="ol
 
 | | What happens |
 |---|---|
-| **robots.txt, properly** | A parser that follows [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309): `*` and `$` wildcards, longest match wins, per-agent groups. If robots.txt is unreachable or returns a server error, the site is treated as off limits. Python's built-in `urllib.robotparser` does none of that. |
+| **robots.txt, properly** | A parser that follows [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309): `*` and `$` wildcards, longest match wins, per-agent groups. Path tricks such as `/a/../private/` or `//private/` are resolved before the rules are applied. If robots.txt is unreachable or returns a server error, the site is treated as off limits. Python's built-in `urllib.robotparser` does none of that. |
 | **AI opt-outs** | Bots declare a purpose (`search`, `ai-input`, `ai-train`, `other`). The fleet honours `Content-Signal` in robots.txt, `X-Robots-Tag: noai` and `<meta name="robots" content="noai">` for both AI purposes, and `tdm-reservation: 1` for `ai-train`. If a page opts out of your bot's purpose, you never receive its content. This relies on you declaring the purpose truthfully. |
-| **Politeness, fleet-wide** | One request at a time per host, with at least `Crawl-delay` (or one second, unless you change it) between them, shared by every bot in the fleet. A thousand bots still look like one considerate visitor. |
-| **Backing off** | `429` and `503` are retried at most twice, after waiting for `Retry-After` (or with growing pauses if the server gives none). If a server asks for a long break, the fleet stops instead of hammering it. |
+| **Politeness, fleet-wide** | One request at a time per host, with at least `Crawl-delay` (or one second, unless you change it) between them, shared by every bot in the fleet. `127.0.0.1`, `127.1` and `127.0.0.1:80` count as the same host. A thousand bots still look like one considerate visitor. |
+| **Backing off** | `429` and `503` are retried at most twice, after waiting for `Retry-After` (or with growing pauses if the server gives none). If a server asks for a long break, the whole site is off limits to every bot in the fleet until the break is over. A server that trickles its reply cannot hold a bot longer than `max_time` (60 seconds). |
 | **Honest identity** | Every request carries `YourBot/1.0 (+contact; purpose=…)`. Bots without contact details, or with names like `Mozilla` or `Googlebot`, refuse to start. |
 | **Checked redirects** | Each redirect hop is checked against the robots.txt of the site it lands on. |
 | **No inside jobs** | Requests to localhost, private networks and cloud metadata addresses are refused by default, which matters when an LLM chooses the URLs. |
-| **An audit log you can prove** | Every allow, block, fetch and retry is appended to a hash-chained JSONL file. Edit, reorder or remove a record and `ebf audit verify` tells you where. To also catch a log that was cut short, keep the last hash it prints and pass it back with `--head`. |
+| **An audit log you can prove** | Every robots.txt request, allow, block, fetch, redirect and retry is appended to a hash-chained JSONL file that several fleets can share. Edit, reorder or remove a record and `ebf audit verify` tells you where. To also catch a log that was cut short, keep the last hash it prints and pass it back with `--head`. |
 
 There is no `ignore_robots=True`. For sites you own, list them in `trusted_domains`; that choice goes in the audit log too.
 
@@ -192,6 +192,7 @@ ebf audit summary audit.jsonl
 | `page_opt_out` | the page itself opted out (`noai`, `tdm-reservation`); content discarded |
 | `crawl_delay_too_long` | the site wants a longer gap than your policy allows, so it is skipped |
 | `retry_after_too_long` | the server asked for a long break |
+| `host_backoff` | the site is still inside a break it asked for earlier |
 | `host_budget` | your own `max_requests_per_host` was reached |
 | `domain_blocked` / `domain_not_allowed` | your own allow and block lists |
 | `private_network` | the address is not on the public internet |
@@ -207,7 +208,8 @@ The [Bot Code of Conduct](docs/BOT_CODE_OF_CONDUCT.md) is the whole philosophy o
 
 - Opt-out standards for AI are still settling. `Content-Signal` and `noai` are supported on a best-effort basis and will track the standards as they change.
 - The private-network check resolves the hostname before the request, so it does not defend against DNS rebinding, and behind an HTTP proxy the proxy does the resolving where this check cannot see. Use a network-level egress policy as well if that matters to you.
-- A hash chain cannot show that records were cut off the end of a log unless you kept the last hash (`ebf audit verify --head`).
+- The audit log shows accidental damage and casual edits. It is not proof against someone who can rewrite the whole file, unless you kept the last hash somewhere they cannot reach (`ebf audit verify --head`).
+- The name check stops the obvious impersonations (browsers and well-known crawlers). It cannot know every crawler name.
 - Concurrency uses threads. An asyncio API is on the roadmap.
 - It follows published rules; it cannot read a site's terms of service for you.
 

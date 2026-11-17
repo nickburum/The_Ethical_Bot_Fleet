@@ -43,29 +43,29 @@ class _MetaScanner(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag != "meta":
             return
-        attr = {k.lower(): (v or "") for k, v in attrs}
-        if attr.get("name", "").strip().lower() in ("robots", self.agent):
-            self.directives.update(_split(attr.get("content", "")))
+        names = [(v or "").strip().lower() for k, v in attrs if k.lower() == "name"]
+        if any(name in ("robots", self.agent) for name in names):
+            for key, value in attrs:  # a repeated content attribute counts every time
+                if key.lower() == "content":
+                    self.directives.update(_split(value or ""))
 
 
 def _split(value: str) -> Set[str]:
-    return {item.strip().lower() for item in value.split(",") if item.strip()}
+    return {item.lower() for item in re.split(r"[,;\s]+", value) if item}
 
 
 def _header_directives(value: str, agent: str) -> Set[str]:
     """Parse X-Robots-Tag, which may be scoped as ``botname: directive``."""
     found: Set[str] = set()
-    # Multiple header lines are joined with ", " so scoping is tracked per item.
-    scope: Optional[str] = None
-    for item in value.split(","):
-        item = item.strip().lower()
-        if not item:
-            continue
-        head, sep, rest = item.partition(":")
-        if sep and head.strip() != "unavailable_after" and " " not in head.strip():
-            scope, item = head.strip(), rest.strip()
-        if scope in (None, agent) and item:
-            found.add(item)
+    for line in value.split("\n"):  # the transport keeps each header line separate
+        scope: Optional[str] = None  # a "botname:" prefix covers the rest of its own line only
+        for item in line.split(","):
+            item = item.strip().lower()
+            head, sep, rest = item.partition(":")
+            if sep and head.strip() != "unavailable_after" and " " not in head.strip():
+                scope, item = head.strip(), rest.strip()
+            if scope in (None, agent):
+                found |= _split(item)
     return found
 
 
@@ -73,7 +73,7 @@ def page_directives(headers: Dict[str, str], body: bytes, agent: str) -> Set[str
     """Collect every robots directive that applies to ``agent`` for this page."""
     agent = agent.lower()
     found = _header_directives(headers.get("x-robots-tag", ""), agent)
-    if headers.get("tdm-reservation", "").strip() == "1":
+    if "1" in re.split(r"[,\s\"']+", headers.get("tdm-reservation", "")):
         found.add("tdm-reservation")
     kind = headers.get("content-type", "").lower()
     if not kind.startswith(_NOT_MARKUP):  # scan anything that could be a page, even if mislabelled

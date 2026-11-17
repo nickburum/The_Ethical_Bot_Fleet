@@ -35,15 +35,15 @@ class HostLimiter:
             return self._hosts.setdefault(host, _Host())
 
     @contextmanager
-    def slot(self, host: str, delay: float, limit: Optional[int] = None) -> Iterator[None]:
+    def slot(self, host: str, delay: float, limit: Optional[int] = None, count: bool = True) -> Iterator[None]:
         state = self._host(host)
         with state.lock:
-            if limit is not None and state.count >= limit:  # checked under the lock, so it cannot be raced
+            if count and limit is not None and state.count >= limit:  # checked under the lock, so it cannot be raced
                 raise BudgetExceeded(host)
             wait = state.next_at - self._clock()
             if wait > 0:
                 self._sleep(wait)
-            state.count += 1
+            state.count += count
             try:
                 yield
             finally:

@@ -71,6 +71,32 @@ class RobotsTests(unittest.TestCase):
         self.assertFalse(allowed(text, "/a.b(c)"))
         self.assertTrue(allowed(text, "/aXb(c)"))
 
+    def test_hostile_pattern_cannot_stall_matching(self):
+        import time
+        text = "User-agent: *\nDisallow: /" + "*a" * 30 + "$\n"
+        started = time.monotonic()
+        self.assertTrue(allowed(text, "/" + "a" * 5000 + "b"))
+        self.assertFalse(allowed(text, "/" + "a" * 5000))
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_more_edge_cases(self):
+        self.assertFalse(allowed("User-agent: AcmeBot/1.0\nDisallow: /x\n", "/x"))
+        self.assertFalse(allowed("User-agent: *\nDisallow: /sp ace\n", "/sp%20ace"))
+        self.assertFalse(allowed("User-agent: *\nDisallow: /pa\nAllow: /%70\n", "/page"))
+        raw = b"User-agent: *\nDisallow: /caf\xe9\n".decode("utf-8", "surrogateescape")
+        self.assertFalse(allowed(raw, "/caf%E9"))
+        self.assertFalse(allowed("User-agent: *\nDisallow: /a*b$\n", "/a-b"))
+        self.assertTrue(allowed("User-agent: *\nDisallow: /a*b$\n", "/a-bc"))
+        self.assertFalse(allowed("User-agent: *\nDisallow: /*.php\n", "/x/index.php?id=1"))
+
+    def test_content_signal_reaches_every_bot(self):
+        own_group = RobotsFile.parse("User-agent: *\nContent-Signal: ai-train=no\n\nUser-agent: acmebot\nAllow: /\n")
+        self.assertIs(own_group.evaluate("AcmeBot", "https://s.example/").signals.get("ai-train"), False)
+        site_wide = RobotsFile.parse("Content-Signal: ai-train=no; ai-input = no\nUser-agent: *\nAllow: /\n")
+        self.assertEqual(site_wide.evaluate("AcmeBot", "https://s.example/").signals, {"ai-train": False, "ai-input": False})
+        tabbed = RobotsFile.parse("User-agent: *\nContent-Signal: /p\tai-train=no\n")
+        self.assertIs(tabbed.evaluate("AcmeBot", "https://s.example/p/1").signals.get("ai-train"), False)
+
     def test_crawl_delay_sitemaps_and_signals(self):
         robots = RobotsFile.parse(
             "Sitemap: https://site.example/sitemap.xml\n"

@@ -13,7 +13,28 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+try:
+    import fcntl
+except ImportError:  # Windows: one writer at a time is then the caller's job
+    fcntl = None  # type: ignore[assignment]
+
 GENESIS = "0" * 64
+
+
+def _tail(handle) -> Optional[Dict[str, Any]]:
+    """The last record in an open log file, or None if it is empty."""
+    handle.seek(0, os.SEEK_END)
+    end = handle.tell()
+    block = b""
+    while end > 0:
+        start = max(0, end - 65536)
+        handle.seek(start)
+        block = handle.read(end - start) + block
+        lines = [line for line in block.split(b"\n") if line.strip()]
+        if len(lines) > 1 or (lines and start == 0):
+            return json.loads(lines[-1].decode("utf-8"))
+        end = start
+    return None
 
 
 def _digest(record: Dict[str, Any]) -> str:
@@ -44,19 +65,33 @@ class AuditLog:
 
     def write(self, event: str, **fields: Any) -> Dict[str, Any]:
         with self._lock:
-            self._seq += 1
-            record: Dict[str, Any] = {"seq": self._seq, "ts": round(self._clock(), 3), "event": event}
-            record.update({k: v for k, v in fields.items() if v is not None})
-            record["prev"] = self._prev
-            record["hash"] = self._prev = _digest(record)
-            if self.path:
-                # Owner-only: the log is a record of what was visited.
-                descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
-            else:
+            if not self.path:
+                record = self._record(event, fields)
                 self.records.append(record)
+                return record
+            # Owner-only: the log is a record of what was visited.
+            descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            with os.fdopen(descriptor, "r+b") as handle:
+                if fcntl is not None:
+                    fcntl.flock(handle, fcntl.LOCK_EX)  # other fleets and processes may share this file
+                try:
+                    last = _tail(handle)
+                    if last is not None:
+                        self._prev, self._seq = last["hash"], last["seq"]
+                except (ValueError, KeyError, TypeError):
+                    raise ValueError("%s is damaged and cannot be appended to" % self.path) from None
+                record = self._record(event, fields)
+                handle.seek(0, os.SEEK_END)
+                handle.write((json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"))
             return record
+
+    def _record(self, event: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        self._seq += 1
+        record: Dict[str, Any] = {"seq": self._seq, "ts": round(self._clock(), 3), "event": event}
+        record.update({k: v for k, v in fields.items() if v is not None})
+        record["prev"] = self._prev
+        record["hash"] = self._prev = _digest(record)
+        return record
 
 
 def read(path: str) -> List[Dict[str, Any]]:
@@ -82,7 +117,7 @@ def verify(path: str, head: Optional[str] = None) -> Tuple[bool, int, str]:
     """
     prev = GENESIS
     count = 0
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue

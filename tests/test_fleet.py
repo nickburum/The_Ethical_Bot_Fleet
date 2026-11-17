@@ -71,6 +71,18 @@ class IdentityTests(unittest.TestCase):
             with self.assertRaises(IdentityError):
                 fleet.bot(name, contact, purpose)
 
+    def test_other_crawlers_and_smuggled_user_agents_are_refused(self):
+        fleet, _, _ = make({})
+        for name in ("GoogleOther", "Applebot", "PerplexityBot", "ChatGPT-User", "Claude-Web", "facebookexternalhit"):
+            with self.assertRaises(IdentityError, msg=name):
+                fleet.bot(name, "https://a.example")
+        with self.assertRaises(IdentityError):
+            fleet.bot("AcmeBot", "https://a.example", version="5.0 (Windows NT 10.0) Chrome/120 Googlebot/2.1")
+        with self.assertRaises(IdentityError):
+            fleet.bot("AcmeBot", "https://x.example) Mozilla/5.0 (X11")
+        with self.assertRaises(IdentityError):
+            fleet.bot("AcmeBot", "https://a.example", version="1.0\r\nX-Evil: 1")
+
     def test_innocent_names_are_accepted(self):
         fleet, _, _ = make({})
         for name in ("KnowledgeBot", "OperationsBot", "LedgerBot", "ParkGuideBot"):
@@ -126,6 +138,11 @@ class DecisionTests(unittest.TestCase):
         self.web.pages["https://site.example/odd"] = http.client.InvalidURL("nope")
         with self.assertRaises(FetchError):
             self.bot.get("https://site.example/odd")
+
+    def test_path_tricks_do_not_get_past_robots(self):
+        for path in ("/a/../private/x", "/./private/x", "//private/x", "/a/%2e%2e/private/x", "/a/%2E%2E//private/x"):
+            self.assertEqual(self.bot.check("https://site.example" + path).reason, "robots_disallow", path)
+        self.assertTrue(self.bot.check("https://site.example/a/../public"))
 
     def test_check_does_not_fetch_the_page(self):
         self.assertTrue(self.bot.check("https://site.example/"))
@@ -189,6 +206,25 @@ class PolicyTests(unittest.TestCase):
             bot.get("https://a.example/2")
         self.assertEqual(caught.exception.decision.reason, "host_budget")
 
+    def test_one_host_spelled_many_ways_is_one_host(self):
+        spellings = ["http://127.0.0.1/a", "http://127.0.0.1:80/b", "http://127.0.0.1:080/c", "http://127.1/d",
+                     "http://2130706433/e", "http://0x7f.0.0.1/f", "http://127.0.0.1./g"]
+        pages = {url: (200, {}, b"x") for url in spellings}
+        fleet, web, _ = make(pages, max_requests_per_host=2, min_delay=0)
+        results = list(fleet.bot("AcmeBot", "https://a.example").crawl(spellings, workers=8))
+        self.assertEqual(sum(1 for r in results if r.response), 2)
+        self.assertEqual(len([u for u, _ in web.requests if u.endswith("robots.txt")]), 1)
+
+    def test_blocked_domain_with_trailing_dot(self):
+        fleet, web, _ = make({}, blocked_domains=["bad.example"])
+        self.assertEqual(fleet.bot("AcmeBot", "https://a.example").check("http://bad.example./x").reason, "domain_blocked")
+        self.assertEqual(web.requests, [])
+
+    def test_policy_rejects_nonsense_numbers(self):
+        for bad in (float("nan"), float("inf"), -1):
+            with self.assertRaises(ValueError):
+                Policy(min_delay=bad)
+
     def test_host_budget_holds_under_concurrency(self):
         pages = {"https://a.example/%d" % i: (200, {}, b"x") for i in range(40)}
         fleet, web, _ = make(pages, max_requests_per_host=5, min_delay=0)
@@ -233,6 +269,40 @@ class PolitenessTests(unittest.TestCase):
         self.assertEqual(caught.exception.decision.reason, "retry_after_too_long")
         self.assertEqual(clock.sleeps, [1.0])
 
+    def test_retry_after_binds_the_host_even_without_a_retry(self):
+        fleet, _, clock = make({"https://a.example/1": (429, {"retry-after": "9"}, b""),
+                                "https://a.example/2": (200, {}, b"ok")}, max_retries=0)
+        bot = fleet.bot("AcmeBot", "https://a.example")
+        self.assertEqual(bot.get("https://a.example/1").status, 429)
+        bot.get("https://a.example/2")
+        self.assertEqual(clock.sleeps, [1.0, 9.0])
+
+    def test_long_break_puts_the_whole_site_off_limits(self):
+        fleet, web, clock = make({"https://a.example/1": (503, {"retry-after": "3600"}, b""),
+                                  "https://a.example/2": (200, {}, b"ok")})
+        bot, other = fleet.bot("AcmeBot", "https://a.example"), fleet.bot("OtherBot", "https://a.example")
+        with self.assertRaises(Blocked):
+            bot.get("https://a.example/1")
+        self.assertEqual(other.check("https://a.example/2").reason, "host_backoff")
+        self.assertNotIn("https://a.example/2", [u for u, _ in web.requests])
+        clock.now += 3601
+        self.assertTrue(other.get("https://a.example/2").ok)
+
+    def test_slow_drip_server_cannot_hold_a_bot(self):
+        import threading
+        release = threading.Event()
+
+        def stuck(url, headers, timeout, max_bytes):
+            release.wait(30)
+            return RawResponse(200, {}, b"")
+
+        fleet = Fleet(Policy(block_private_networks=False, max_time=0.2), transport=stuck)
+        bot = fleet.bot("AcmeBot", "https://a.example")
+        try:
+            self.assertEqual(bot.check("https://a.example/").reason, "site_unreachable")
+        finally:
+            release.set()
+
     def test_retries_are_bounded(self):
         fleet, web, _ = make({"https://a.example/": (503, {}, b"")}, max_retries=2)
         self.assertEqual(fleet.bot("AcmeBot", "https://a.example").get("https://a.example/").status, 503)
@@ -263,6 +333,24 @@ class RedirectTests(unittest.TestCase):
         })
         response = fleet.bot("AcmeBot", "https://a.example").get("https://a.example/old")
         self.assertEqual((response.url, response.history), ("https://a.example/new", ["https://a.example/old"]))
+
+    def test_robots_redirect_gets_the_same_checks_as_any_address(self):
+        for target in ("https://blocked.example/robots.txt", "ftp://a.example/robots.txt", "file:///etc/hostname"):
+            fleet, web, _ = make({"https://a.example/robots.txt": (302, {"location": target}, b"")},
+                                 blocked_domains=["blocked.example"])
+            self.assertEqual(fleet.bot("AcmeBot", "https://a.example").check("https://a.example/").reason,
+                             "robots_unreachable", target)
+            self.assertEqual([u for u, _ in web.requests], ["https://a.example/robots.txt"])
+
+    def test_odd_redirect_targets_are_handled(self):
+        fleet, _, _ = make({"https://a.example/1": (302, {"location": "/caf\u00e9 x"}, b""),
+                            "https://a.example/caf%C3%A9%20x": (200, {}, b"ok"),
+                            "https://a.example/2": (302, {"location": "http://h:notaport/"}, b"")}, min_delay=0)
+        bot = fleet.bot("AcmeBot", "https://a.example")
+        self.assertEqual(bot.get("https://a.example/1").body, b"ok")
+        with self.assertRaises(Blocked) as caught:
+            bot.get("https://a.example/2")
+        self.assertEqual(caught.exception.decision.reason, "bad_url")
 
     def test_redirect_loops_end(self):
         fleet, _, _ = make({"https://a.example/loop": (302, {"location": "/loop"}, b"")}, min_delay=0)
@@ -319,6 +407,25 @@ class AiSignalTests(unittest.TestCase):
             with self.assertRaises(Blocked, msg=url):
                 fleet.bot("AcmeBot", "https://a.example", "ai-input").get(url)
 
+    def test_opt_out_spellings(self):
+        cases = {
+            "two-lines": {"x-robots-tag": "googlebot: noindex\nnoai"},
+            "spaces": {"x-robots-tag": "noai noimageai"},
+            "semicolon": {"x-robots-tag": "noai;"},
+        }
+        for name, headers in cases.items():
+            fleet, _, _ = make({"https://b.example/x": (200, headers, b"x")}, min_delay=0)
+            with self.assertRaises(Blocked, msg=name):
+                fleet.bot("AcmeBot", "https://a.example", "ai-input").get("https://b.example/x")
+        for value in ("1, 1", '"1"'):
+            fleet, _, _ = make({"https://b.example/x": (200, {"tdm-reservation": value}, b"x")}, min_delay=0)
+            with self.assertRaises(Blocked, msg=value):
+                fleet.bot("AcmeBot", "https://a.example", "ai-train").get("https://b.example/x")
+        page = b'<meta name="robots" content="noai noimageai"><meta name="robots" content="index" content="noai">'
+        fleet, _, _ = make({"https://b.example/x": (200, HTML, page)}, min_delay=0)
+        with self.assertRaises(Blocked):
+            fleet.bot("AcmeBot", "https://a.example", "ai-train").get("https://b.example/x")
+
     def test_agent_scoped_header(self):
         self.assertTrue(self.bot("ai-train")[0].get("https://b.example/scoped").ok)
         with self.assertRaises(Blocked):
@@ -353,11 +460,11 @@ class AuditTests(unittest.TestCase):
                 bot.get("https://a.example/")
                 bot.check("https://a.example/private/x")
             ok, count, _ = verify_audit_log(path)
-            self.assertEqual((ok, count), (True, 6))
+            self.assertEqual((ok, count), (True, 8))  # robots, allow, fetch, block, once per fleet
 
             with open(path, encoding="utf-8") as handle:
                 lines = handle.readlines()
-            self.assertEqual([json.loads(line)["event"] for line in lines[:3]], ["allow", "fetch", "block"])
+            self.assertEqual([json.loads(line)["event"] for line in lines[:4]], ["robots", "allow", "fetch", "block"])
 
             edited = json.loads(lines[2])
             edited["event"] = "allow"
@@ -382,6 +489,15 @@ class AuditTests(unittest.TestCase):
             self.assertFalse(verify_audit_log(path, head)[0])
             if os.name == "posix":
                 self.assertEqual(os.stat(path).st_mode & 0o077, 0)
+
+    def test_two_fleets_can_share_one_log(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "audit.jsonl")
+            one, _, _ = make({}, audit_log=path)
+            two, _, _ = make({}, audit_log=path)
+            for fleet in (one, two, one, two, one):
+                fleet.bot("AcmeBot", "https://a.example").check("ftp://nope")
+            self.assertEqual(verify_audit_log(path)[:2], (True, 5))
 
     def test_damaged_logs_give_clear_errors(self):
         with tempfile.TemporaryDirectory() as folder:

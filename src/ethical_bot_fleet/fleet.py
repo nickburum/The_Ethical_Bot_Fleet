@@ -5,6 +5,7 @@ from __future__ import annotations
 import email.utils
 import http.client
 import ipaddress
+import math
 import re
 import socket
 import threading
@@ -12,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from . import __version__
 from .audit import AuditLog
@@ -26,9 +27,14 @@ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # Names a bot may not use, because they belong to browsers or to someone else's crawler.
 # Distinctive names are refused anywhere in the bot's name; short common words only at the start.
 _IMPERSONATION_ANYWHERE = (
-    "mozilla", "applewebkit", "googlebot", "bingbot", "gptbot", "claudebot", "duckduckbot",
-    "yandexbot", "baiduspider", "python-requests", "python-urllib",
+    "mozilla", "applewebkit", "gecko", "trident", "msie", "python-requests", "python-urllib",
+    "google", "bing", "msnbot", "gptbot", "chatgpt", "openai", "oai-", "claude", "anthropic", "duckduck",
+    "yandexbot", "baidu", "applebot", "bytespider", "perplexity", "amazonbot", "ahrefs", "semrush",
+    "facebook", "meta-external", "twitterbot", "slurp", "petalbot",
 )
+_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+_CONTACT_URL = re.compile(r"^https?://[^\s()<>\"';]+$")
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")  # maps onto IPv4, including private IPv4
 _IMPERSONATION_WORD = re.compile(r"^(chrome|chromium|safari|firefox|edge|opera|curl|wget|ccbot|yandex)(bot)?([^a-z]|$)")
 # Errors the HTTP layer can raise: network failures and URLs it cannot send.
 _TRANSPORT_ERRORS = (OSError, http.client.HTTPException, ValueError)
@@ -74,9 +80,16 @@ class Policy:
     max_retries: int = 2
     max_retry_after: float = 120.0
     max_redirects: int = 5
-    timeout: float = 20.0
+    timeout: float = 20.0  # seconds of silence before a connection is abandoned
+    max_time: float = 60.0  # seconds allowed for one whole request, however slowly it trickles in
     max_bytes: int = 10 * 1024 * 1024
     robots_ttl: float = 3600.0
+
+    def __post_init__(self) -> None:
+        for name in ("min_delay", "max_crawl_delay", "max_retry_after", "timeout", "max_time", "robots_ttl"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError("%s must be a number of seconds, zero or more (got %r)" % (name, value))
 
 
 @dataclass(frozen=True)
@@ -126,17 +139,58 @@ class Result:
 
 
 def _domain_in(host: str, domains: Iterable[str]) -> bool:
-    return any(host == d.lower() or host.endswith("." + d.lower()) for d in domains)
+    return any(host == d.lower().rstrip(".") or host.endswith("." + d.lower().rstrip(".")) for d in domains)
+
+
+def _remove_dots(path: str) -> str:
+    """Resolve "." and ".." segments (also when written %2e), as a web server would."""
+    segments = path.split("/")
+    out: List[str] = []
+    for index, segment in enumerate(segments):
+        plain = segment.replace("%2e", ".").replace("%2E", ".")
+        if plain in (".", ".."):
+            if plain == ".." and len(out) > 1:
+                out.pop()
+            if index == len(segments) - 1:
+                out.append("")
+            continue
+        out.append(segment)
+    return "/".join(out) or "/"
 
 
 def clean_url(url: str) -> str:
-    """Percent-encode spaces and non-ASCII characters so the URL can be sent."""
-    return quote(url.strip(), safe="%/:=&?~#+!$,;'@()*[]")
+    """Put a URL in the form that is checked and sent: encoded, without dot segments or fragment."""
+    url = quote(url.strip(), safe="%/:=&?~#+!$,;'@()*[]")
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url  # refused later as a bad URL
+    if parts.scheme.lower() in ("http", "https") and parts.netloc:
+        return urlunsplit((parts.scheme.lower(), parts.netloc, _remove_dots(parts.path or "/"), parts.query, ""))
+    return url
+
+
+def _canonical_host(host: str) -> str:
+    """One spelling per host: 127.1, 0x7f.0.0.1 and 2130706433 are all 127.0.0.1."""
+    host = host.lower().rstrip(".")
+    try:
+        return str(ipaddress.ip_address(host.strip("[]").split("%")[0]))
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9a-fx.]+", host):
+        try:
+            return socket.inet_ntoa(socket.inet_aton(host))
+        except OSError:
+            pass
+    return host
 
 
 def _origin(url: str) -> str:
+    """The key for everything that is per-site: politeness, budget and the robots.txt cache."""
     parts = urlsplit(url)
-    return "%s://%s" % (parts.scheme.lower(), parts.netloc.lower())
+    scheme = parts.scheme.lower()
+    host = _canonical_host(parts.hostname or "")
+    return "%s://%s:%d" % (scheme, "[%s]" % host if ":" in host else host, parts.port or (443 if scheme == "https" else 80))
 
 
 def _resolve(host: str) -> List[str]:
@@ -166,9 +220,11 @@ class Bot:
         lowered = name.lower()
         if any(word in lowered for word in _IMPERSONATION_ANYWHERE) or _IMPERSONATION_WORD.match(lowered):
             raise IdentityError("bot name %r imitates a browser or another crawler; pick your own name" % name)
-        is_url = contact.startswith(("https://", "http://")) and "." in (urlsplit(contact).hostname or "")
+        is_url = bool(_CONTACT_URL.match(contact)) and "." in (urlsplit(contact).hostname or "")
         if not (is_url or _EMAIL.match(contact)):
             raise IdentityError("contact must be a URL or an email address where site owners can reach you")
+        if not _VERSION.match(version):
+            raise IdentityError("version must look like 1.0 or 2024.1-beta, got %r" % version)
         if purpose not in PURPOSES:
             raise IdentityError("purpose must be one of %s, got %r" % (", ".join(PURPOSES), purpose))
         self.fleet = fleet
@@ -197,6 +253,8 @@ class Bot:
                 return Result(url, response=self.get(url))
             except FleetError as error:
                 return Result(url, error=error)
+            except Exception as error:  # one odd URL must never end the whole crawl
+                return Result(url, error=FetchError("%s: %s" % (url, error)))
 
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             for future in as_completed([pool.submit(one, url) for url in unique]):
@@ -228,6 +286,7 @@ class Fleet:
         self._limiter = HostLimiter(clock, sleep)
         self._robots: Dict[str, Tuple[float, RobotsFile]] = {}
         self._robots_locks: Dict[str, threading.Lock] = {}
+        self._cooldown: Dict[str, float] = {}  # sites that asked this fleet to stay away, and until when
         self._lock = threading.Lock()
 
     def bot(self, name: str, contact: str, purpose: str = "other", version: str = "1.0") -> Bot:
@@ -246,38 +305,61 @@ class Fleet:
             cached = self._robots.get(origin)
             if cached and cached[0] > self._clock():
                 return cached[1]
-            parsed = self._fetch_robots(bot, origin)
-            # The robots.txt request counts as a visit: the first page waits its turn after it.
-            self._limiter.penalize(origin, self.policy.min_delay)
+            parts = urlsplit(url)
+            # The robots.txt request is a visit like any other: it takes its turn in the same queue.
+            with self._limiter.slot(origin, self.policy.min_delay, count=False):
+                parsed, hold = self._fetch_robots(bot, "%s://%s/robots.txt" % (parts.scheme.lower(), parts.netloc.lower()))
             ttl = min(self.policy.robots_ttl, _ROBOTS_MAX_TTL)
             if parsed.mode in ("disallow_all", "unreachable"):
-                ttl = min(ttl, 60.0)  # look again soon; the site may just be having a bad minute
+                # Look again in a minute, or when the server said to; never sooner.
+                ttl = min(max(60.0, hold), _ROBOTS_MAX_TTL)
             self._robots[origin] = (self._clock() + ttl, parsed)
             return parsed
 
-    def _fetch_robots(self, bot: Bot, origin: str) -> RobotsFile:
-        url = origin + "/robots.txt"
+    def _request(self, bot: Bot, url: str, max_bytes: int) -> RawResponse:
+        """One HTTP request with a hard overall time limit, so a trickling server cannot hold a bot."""
+        box: Dict[str, object] = {}
+
+        def work() -> None:
+            try:
+                box["raw"] = self._transport(url, {"User-Agent": bot.user_agent}, self.policy.timeout, max_bytes)
+            except BaseException as error:  # handed back to the calling thread
+                box["error"] = error
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        worker.join(self.policy.max_time)
+        if worker.is_alive():
+            raise TimeoutError("no complete response within %g seconds" % self.policy.max_time)
+        if "error" in box:
+            raise box["error"]  # type: ignore[misc]
+        return box["raw"]  # type: ignore[return-value]
+
+    def _fetch_robots(self, bot: Bot, url: str) -> Tuple[RobotsFile, float]:
+        host = urlsplit(url).hostname
         try:
             for _ in range(6):
-                raw = self._transport(url, {"User-Agent": bot.user_agent}, self.policy.timeout, _ROBOTS_MAX_BYTES)
+                raw = self._request(bot, url, _ROBOTS_MAX_BYTES)
+                self.audit.write("robots", bot=bot.name, url=url, status=raw.status)
                 location = raw.headers.get("location")
                 if raw.status in (301, 302, 303, 307, 308) and location:
-                    url = urljoin(url, location)
-                    private = self._private(urlsplit(url).hostname or "")
-                    if private:
-                        return RobotsFile.disallow_all("robots.txt redirects to a private address")
+                    url = clean_url(urljoin(url, location))
+                    refusal = self._static(url)  # the same checks as any other address
+                    if refusal:
+                        return RobotsFile.disallow_all("robots.txt redirects somewhere this fleet may not go (%s)" % refusal[0]), 0.0
                     continue
                 break
             else:
-                return RobotsFile.disallow_all("robots.txt redirected too many times")
+                return RobotsFile.disallow_all("robots.txt redirected too many times"), 0.0
         except _TRANSPORT_ERRORS as error:
-            return RobotsFile.unreachable("could not connect to %s (%s)" % (urlsplit(origin).hostname, error))
+            return RobotsFile.unreachable("could not connect to %s (%s)" % (host, error)), 0.0
         if 200 <= raw.status < 300:
-            return RobotsFile.parse(raw.body.decode("utf-8", "replace"))
+            return RobotsFile.parse(raw.body.decode("utf-8", "surrogateescape")), 0.0
         if raw.status == 429 or raw.status >= 500:
             # RFC 9309: if the file is unreachable, assume complete disallow.
-            return RobotsFile.disallow_all("robots.txt returned HTTP %d" % raw.status)
-        return RobotsFile.allow_all("no robots.txt (HTTP %d)" % raw.status)
+            hold = _retry_after(raw.headers.get("retry-after", ""), time.time()) or 0.0
+            return RobotsFile.disallow_all("robots.txt returned HTTP %d" % raw.status), hold
+        return RobotsFile.allow_all("no robots.txt (HTTP %d)" % raw.status), 0.0
 
     # -- decisions --------------------------------------------------------
 
@@ -289,8 +371,35 @@ class Fleet:
         except OSError:
             return None  # let the fetch itself report the DNS failure
         for address in addresses:
-            if not ipaddress.ip_address(address.split("%")[0]).is_global:
+            ip = ipaddress.ip_address(address.split("%")[0])
+            if not ip.is_global or (ip.version == 6 and ip in _NAT64):
                 return address
+        return None
+
+    def _static(self, url: str) -> Optional[Tuple[str, str]]:
+        """Checks that need no request: is this an address the fleet may contact at all?"""
+        policy = self.policy
+        try:
+            parts = urlsplit(url)
+            parts.port  # raises ValueError for a port that is not a number
+            host = (parts.hostname or "").lower().rstrip(".")
+        except ValueError:
+            return "bad_url", "this is not a valid URL"
+        if "://" not in url:
+            return "bad_url", "the address needs to start with https:// (did you mean https://%s ?)" % url
+        if parts.scheme not in ("http", "https") or not host or any(c.isspace() or ord(c) < 32 for c in url):
+            return "bad_url", "only http and https URLs can be fetched"
+        if parts.username or parts.password:
+            return "bad_url", "URLs with embedded credentials are not fetched"
+        if ".." in host or any(len(label) > 63 for label in host.split(".")) or len(host) > 253:
+            return "bad_url", "this is not a valid host name"
+        if _domain_in(host, policy.blocked_domains):
+            return "domain_blocked", "%s is on this fleet's blocked list" % host
+        if policy.allowed_domains is not None and not _domain_in(host, policy.allowed_domains):
+            return "domain_not_allowed", "%s is not on this fleet's allowed list" % host
+        private = self._private(host)
+        if private:
+            return "private_network", "%s resolves to %s, which is not a public address" % (host, private)
         return None
 
     def _check(self, bot: Bot, url: str) -> Decision:
@@ -308,25 +417,13 @@ class Fleet:
         def no(reason: str, detail: str, rule: Optional[str] = None) -> Decision:
             return Decision(False, url, reason, detail, rule)
 
-        try:
-            parts = urlsplit(url)
-            parts.port  # raises ValueError for a port that is not a number
-            host = (parts.hostname or "").lower()
-        except ValueError:
-            return no("bad_url", "this is not a valid URL")
-        if "://" not in url:
-            return no("bad_url", "the address needs to start with https:// (did you mean https://%s ?)" % url)
-        if parts.scheme not in ("http", "https") or not host or any(c.isspace() or ord(c) < 32 for c in url):
-            return no("bad_url", "only http and https URLs can be fetched")
-        if parts.username or parts.password:
-            return no("bad_url", "URLs with embedded credentials are not fetched")
-        if _domain_in(host, policy.blocked_domains):
-            return no("domain_blocked", "%s is on this fleet's blocked list" % host)
-        if policy.allowed_domains is not None and not _domain_in(host, policy.allowed_domains):
-            return no("domain_not_allowed", "%s is not on this fleet's allowed list" % host)
-        private = self._private(host)
-        if private:
-            return no("private_network", "%s resolves to %s, which is not a public address" % (host, private))
+        refusal = self._static(url)
+        if refusal:
+            return no(*refusal)
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        away = self._cooldown.get(_origin(url), 0.0) - self._clock()
+        if away > 0:
+            return no("host_backoff", "%s asked this fleet to stay away; %d more seconds" % (host, math.ceil(away)))
         limit = policy.max_requests_per_host
         if limit is not None and self._limiter.count(_origin(url)) >= limit:
             return no("host_budget", "this fleet already made %d requests to %s" % (limit, host))
@@ -367,8 +464,9 @@ class Fleet:
             raw = self._send(bot, url, decision)
             location = raw.headers.get("location")
             if raw.status in (301, 302, 303, 307, 308) and location:
+                self.audit.write("redirect", bot=bot.name, purpose=bot.purpose, url=url, status=raw.status)
                 history.append(url)
-                url = urljoin(url, location)  # the next hop is checked like any other URL
+                url = clean_url(urljoin(url, location))  # the next hop is checked like any other URL
                 continue
             directives: Set[str] = set()
             if not decision.trusted:
@@ -400,7 +498,7 @@ class Fleet:
         while True:
             try:
                 with self._limiter.slot(host, delay, policy.max_requests_per_host):
-                    raw = self._transport(url, {"User-Agent": bot.user_agent}, policy.timeout, policy.max_bytes)
+                    raw = self._request(bot, url, policy.max_bytes)
             except BudgetExceeded:
                 blocked = Decision(
                     False, url, "host_budget",
@@ -411,21 +509,23 @@ class Fleet:
             except _TRANSPORT_ERRORS as error:
                 self.audit.write("error", bot=bot.name, purpose=bot.purpose, url=url, detail=str(error))
                 raise FetchError("%s: %s" % (url, error)) from error
-            if raw.status not in (429, 503) or attempt >= policy.max_retries:
+            if raw.status not in (429, 503):
                 return raw
-            attempt += 1
-            wait = _retry_after(raw.headers.get("retry-after", ""), time.time())
-            if wait is None:
-                wait = delay * (2 ** attempt)
-            if wait > policy.max_retry_after:
+            asked = _retry_after(raw.headers.get("retry-after", ""), time.time())
+            if asked is not None and asked > policy.max_retry_after:
+                # A long break means stop: the whole site is off limits to every bot until it passes.
+                self._cooldown[host] = self._clock() + min(asked, 24 * 3600.0)
                 blocked = Decision(
                     False, url, "retry_after_too_long",
-                    "server asked us to wait %gs (HTTP %d); backing off instead of retrying" % (wait, raw.status),
+                    "server asked us to wait %gs (HTTP %d); leaving the site alone until then" % (asked, raw.status),
                 )
-                self._limiter.penalize(host, policy.max_retry_after)
                 self.audit.write("block", bot=bot.name, purpose=bot.purpose, url=url, reason=blocked.reason, detail=blocked.detail)
                 raise Blocked(blocked)
-            self._limiter.penalize(host, wait)
+            attempt += 1
+            wait = asked if asked is not None else min(delay * (2 ** attempt), policy.max_retry_after)
+            self._limiter.penalize(host, wait)  # honoured whether or not this URL is tried again
+            if attempt > policy.max_retries:
+                return raw
             self.audit.write("retry", bot=bot.name, purpose=bot.purpose, url=url, status=raw.status, wait=round(wait, 3))
 
 

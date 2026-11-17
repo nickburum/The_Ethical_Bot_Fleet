@@ -193,6 +193,15 @@ def _origin(url: str) -> str:
     return "%s://%s:%d" % (scheme, "[%s]" % host if ":" in host else host, parts.port or (443 if scheme == "https" else 80))
 
 
+def _location(base: str, value: str) -> str:
+    """The absolute, cleaned target of a redirect."""
+    try:  # header bytes arrive decoded as Latin-1; real-world non-ASCII targets are UTF-8
+        value = value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return clean_url(urljoin(base, value))
+
+
 def _resolve(host: str) -> List[str]:
     return [info[4][0] for info in socket.getaddrinfo(host, None)]
 
@@ -343,7 +352,7 @@ class Fleet:
                 self.audit.write("robots", bot=bot.name, url=url, status=raw.status)
                 location = raw.headers.get("location")
                 if raw.status in (301, 302, 303, 307, 308) and location:
-                    url = clean_url(urljoin(url, location))
+                    url = _location(url, location)
                     refusal = self._static(url)  # the same checks as any other address
                     if refusal:
                         return RobotsFile.disallow_all("robots.txt redirects somewhere this fleet may not go (%s)" % refusal[0]), 0.0
@@ -466,7 +475,7 @@ class Fleet:
             if raw.status in (301, 302, 303, 307, 308) and location:
                 self.audit.write("redirect", bot=bot.name, purpose=bot.purpose, url=url, status=raw.status)
                 history.append(url)
-                url = clean_url(urljoin(url, location))  # the next hop is checked like any other URL
+                url = _location(url, location)  # the next hop is checked like any other URL
                 continue
             directives: Set[str] = set()
             if not decision.trusted:

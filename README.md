@@ -209,6 +209,7 @@ The [Bot Code of Conduct](docs/BOT_CODE_OF_CONDUCT.md) is the whole philosophy o
 - Opt-out standards for AI are still settling. `Content-Signal` and `noai` are supported on a best-effort basis and will track the standards as they change.
 - The private-network check resolves the hostname before the request, so it does not defend against DNS rebinding, and behind an HTTP proxy the proxy does the resolving where this check cannot see. Use a network-level egress policy as well if that matters to you.
 - The audit log shows accidental damage and casual edits. It is not proof against someone who can rewrite the whole file, unless you kept the last hash somewhere they cannot reach (`ebf audit verify --head`).
+- Two different names for one server (say `example.com` and `www.example.com`) are treated as two sites, each with its own pause and budget.
 - The name check stops the obvious impersonations (browsers and well-known crawlers). It cannot know every crawler name.
 - Concurrency uses threads. An asyncio API is on the roadmap.
 - It follows published rules; it cannot read a site's terms of service for you.

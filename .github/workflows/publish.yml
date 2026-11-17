@@ -1,0 +1,29 @@
+name: publish
+
+# Runs when you publish a GitHub release. Uses PyPI trusted publishing, so no
+# token is stored in the repository: add this repository and workflow as a
+# trusted publisher on pypi.org first.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build
+      - run: python -m unittest discover -s tests
+        env:
+          PYTHONPATH: src
+      - run: python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1

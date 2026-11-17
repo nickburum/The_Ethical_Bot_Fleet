@@ -40,6 +40,29 @@ Pure Python standard library. No dependencies. Python 3.9+.
 pip install git+https://github.com/nickburum/The_Ethical_Bot_Fleet
 ```
 
+## Try it in ten seconds: find the dead links in your README
+
+```bash
+ebf links README.md
+```
+
+```text
+BROKEN   https://example.com/old-docs  (404)
+skipped       https://example.org/members  (robots_disallow)
+41 links: 39 ok, 1 broken, 1 skipped because the site said no
+```
+
+It exits non-zero when a link is broken, so it drops straight into CI, and it will not get your CI
+runner banned for hammering someone's server.
+
+## What people use it for
+
+- **Research agents.** An LLM that reads the web to answer questions, and only reads what it is allowed to.
+- **Search and RAG indexing.** Build an index of public docs while honouring `noai` and crawl delays.
+- **Dead-link and uptime checks.** For your docs, your awesome-list, or your own sites.
+- **Training-data collection with a paper trail.** Skip everything that opted out, and keep the log that proves it.
+- **Checking your own site.** `ebf check --purpose ai-train https://your.site/` shows what a well-behaved AI crawler would conclude from your robots.txt.
+
 ## What the fleet does for you
 
 | | What happens |
@@ -99,6 +122,10 @@ ebf check https://example.com/page
 
 ```bash
 ebf fetch --agent AcmeBot --contact https://acme.example/bot https://example.com/page
+```
+
+```bash
+ebf links README.md docs/*.md
 ```
 
 ```bash

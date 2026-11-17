@@ -26,7 +26,7 @@ def normalize_path(value: str) -> str:
     i = 0
     while i < len(raw):
         c = raw[i]
-        if c == 0x25 and i + 2 < len(raw) + 0 and raw[i + 1] in _HEX and raw[i + 2] in _HEX:
+        if c == 0x25 and i + 2 < len(raw) and raw[i + 1] in _HEX and raw[i + 2] in _HEX:
             v = int(raw[i + 1 : i + 3], 16)
             if v in _UNRESERVED:
                 out.append(v)

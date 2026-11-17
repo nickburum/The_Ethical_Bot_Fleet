@@ -17,25 +17,37 @@ from .signals import PURPOSES
 
 PROJECT_URL = "https://github.com/nickburum/The_Ethical_Bot_Fleet"
 EXIT_BLOCKED = 3
+_LINK = re.compile(r"https?://[^\s<>\"'`)\]]+")
+
+EPILOG = """\
+examples:
+  ebf read https://example.com/            read a page as plain text (no AI needed)
+  ebf check https://example.com/page       may a bot fetch this?
+  ebf links README.md                      find dead links
+  ebf models                               which AI models are ready to use
+  ebf ask "What is this page about?" https://example.com/ --model ollama
+
+privacy: no accounts, no telemetry, nothing stored unless you pass --audit-log.
+"""
 
 
-def _fleet(args: argparse.Namespace) -> Fleet:
+def _bot(args: argparse.Namespace, purpose: Optional[str] = None):
     policy = Policy(block_private_networks=not args.allow_private, min_delay=args.delay)
-    return Fleet(policy, audit_log=args.audit_log)
+    return Fleet(policy, audit_log=args.audit_log).bot(args.agent, args.contact, purpose or args.purpose)
 
 
-def _add_identity(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("url", nargs="+")
-    parser.add_argument("--agent", default="EthicalFleetCLI", help="bot name to check as (default: %(default)s)")
-    parser.add_argument("--contact", default=PROJECT_URL, help="URL or email where site owners can reach you")
-    parser.add_argument("--purpose", default="other", choices=PURPOSES)
-    parser.add_argument("--audit-log", metavar="FILE", help="append decisions to this audit log")
-    parser.add_argument("--delay", type=float, default=1.0, help="seconds between requests to one host")
-    parser.add_argument("--allow-private", action="store_true", help="allow localhost and private addresses")
+def _options(parser: argparse.ArgumentParser, purpose: str = "other") -> None:
+    group = parser.add_argument_group("bot options (the defaults are fine)")
+    group.add_argument("--agent", default="EthicalFleetCLI", help="the bot's name (default: %(default)s)")
+    group.add_argument("--contact", default=PROJECT_URL, help="URL or email where site owners can reach the operator")
+    group.add_argument("--purpose", default=purpose, choices=PURPOSES, help="why the bot is reading (default: %(default)s)")
+    group.add_argument("--audit-log", metavar="FILE", help="append every decision to this file (off by default)")
+    group.add_argument("--delay", type=float, default=1.0, help="seconds between requests to one site")
+    group.add_argument("--allow-private", action="store_true", help="allow localhost and private addresses")
 
 
 def _check(args: argparse.Namespace) -> int:
-    bot = _fleet(args).bot(args.agent, args.contact, args.purpose)
+    bot = _bot(args)
     worst = 0
     for url in args.url:
         decision = bot.check(url)
@@ -53,8 +65,10 @@ def _check(args: argparse.Namespace) -> int:
     return worst
 
 
-def _fetch(args: argparse.Namespace) -> int:
-    bot = _fleet(args).bot(args.agent, args.contact, args.purpose)
+def _get(args: argparse.Namespace, as_text: bool) -> int:
+    from .text import readable
+
+    bot = _bot(args)
     worst = 0
     for url in args.url:
         try:
@@ -68,15 +82,18 @@ def _fetch(args: argparse.Namespace) -> int:
             worst = worst or 1
             continue
         print("%d  %s  (%d bytes)" % (response.status, response.url, len(response.body)), file=sys.stderr)
-        sys.stdout.buffer.write(response.body)
+        if as_text:
+            print(readable(response))
+        else:
+            sys.stdout.flush()
+            sys.stdout.buffer.write(response.body)
+        if not response.ok:
+            worst = worst or 1
     return worst
 
 
-_LINK = re.compile(r"https?://[^\s<>\"'`)\]]+")
-
-
 def _links(args: argparse.Namespace) -> int:
-    bot = _fleet(args).bot(args.agent, args.contact, args.purpose)
+    bot = _bot(args)
     urls: List[str] = []
     for source in args.url:
         if source.startswith(("http://", "https://")):
@@ -101,6 +118,30 @@ def _links(args: argparse.Namespace) -> int:
     print("%d links: %d ok, %d broken, %d skipped because the site said no" % (
         len(urls), len(urls) - broken - skipped, broken, skipped))
     return 1 if broken else 0
+
+
+def _ask(args: argparse.Namespace) -> int:
+    from .llm import ask
+
+    answer = ask(
+        _bot(args), args.question, args.url, model=args.model, base_url=args.base_url,
+        on_event=lambda message: print("· " + message, file=sys.stderr),
+    )
+    print(answer)
+    return 0
+
+
+def _models(args: argparse.Namespace) -> int:
+    from .llm import status
+
+    rows = status()
+    for local in (False, True):
+        print("on your machine (private, no key):" if local else "cloud:")
+        for name, preset, ready, note in rows:
+            if preset.local == local:
+                print("  %s %-11s %-30s %s" % ("✓" if ready else "·", name, preset.label, note))
+    print('\nuse one with:  ebf ask "your question" URL --model NAME        (or NAME:MODEL_ID)')
+    return 0
 
 
 def _audit_verify(args: argparse.Namespace) -> int:
@@ -129,24 +170,46 @@ def _audit_summary(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="ebf", description="The Ethical Bot Fleet: bots that behave themselves.")
+    parser = argparse.ArgumentParser(
+        prog="ebf", description="The Ethical Bot Fleet: bots with manners.",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--version", action="version", version="ethical-bot-fleet " + __version__)
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command", required=True, metavar="command")
 
-    check = commands.add_parser("check", help="may a bot fetch this URL? (reads robots.txt only)")
-    _add_identity(check)
-    check.add_argument("--json", action="store_true", help="one JSON object per URL")
-    check.set_defaults(run=_check)
+    sub = commands.add_parser("read", help="read a page as plain text (no AI needed)")
+    sub.add_argument("url", nargs="+")
+    _options(sub)
+    sub.set_defaults(run=lambda args: _get(args, True))
 
-    fetch = commands.add_parser("fetch", help="fetch a URL politely and print the body")
-    _add_identity(fetch)
-    fetch.set_defaults(run=_fetch)
+    sub = commands.add_parser("ask", help="ask an AI model a question about web pages")
+    sub.add_argument("question")
+    sub.add_argument("url", nargs="*", help="pages to read first (the model can ask for more)")
+    sub.add_argument("--model", help="preset name, or NAME:MODEL_ID (see `ebf models`); default: $EBF_MODEL")
+    sub.add_argument("--base-url", help="address of an OpenAI-compatible server, e.g. http://localhost:11434/v1")
+    _options(sub, purpose="ai-input")
+    sub.set_defaults(run=_ask)
 
-    links = commands.add_parser("links", help="find dead links in files or pages, politely")
-    _add_identity(links)
-    links.add_argument("--workers", type=int, default=16)
-    links.add_argument("-v", "--verbose", action="store_true", help="also list working links")
-    links.set_defaults(run=_links)
+    sub = commands.add_parser("models", help="list AI model presets and which are ready")
+    sub.set_defaults(run=_models)
+
+    sub = commands.add_parser("check", help="may a bot fetch this URL? (reads robots.txt only)")
+    sub.add_argument("url", nargs="+")
+    sub.add_argument("--json", action="store_true", help="one JSON object per URL")
+    _options(sub)
+    sub.set_defaults(run=_check)
+
+    sub = commands.add_parser("links", help="find dead links in files or pages")
+    sub.add_argument("url", nargs="+", metavar="file_or_url")
+    sub.add_argument("--workers", type=int, default=16)
+    sub.add_argument("-v", "--verbose", action="store_true", help="also list working links")
+    _options(sub)
+    sub.set_defaults(run=_links)
+
+    sub = commands.add_parser("fetch", help="fetch a URL and print the raw body")
+    sub.add_argument("url", nargs="+")
+    _options(sub)
+    sub.set_defaults(run=lambda args: _get(args, False))
 
     audit = commands.add_parser("audit", help="inspect an audit log").add_subparsers(dest="action", required=True)
     for name, run, text in (
@@ -166,6 +229,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except OSError as error:
         print("error: %s" % error, file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

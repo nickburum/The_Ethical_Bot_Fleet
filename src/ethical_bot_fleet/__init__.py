@@ -15,10 +15,11 @@ from .fleet import (  # noqa: E402
     Response,
     Result,
 )
+from .llm import PRESETS, LLMError, ask  # noqa: E402
 from .robots import RobotsFile  # noqa: E402
 from .signals import PURPOSES  # noqa: E402
 
 __all__ = [
-    "AuditLog", "Blocked", "Bot", "Decision", "FetchError", "Fleet", "FleetError", "IdentityError",
-    "Policy", "PURPOSES", "Response", "Result", "RobotsFile", "verify_audit_log", "__version__",
+    "AuditLog", "ask", "Blocked", "Bot", "Decision", "FetchError", "Fleet", "FleetError", "IdentityError", "LLMError",
+    "Policy", "PRESETS", "PURPOSES", "Response", "Result", "RobotsFile", "verify_audit_log", "__version__",
 ]

@@ -8,23 +8,55 @@
 ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 Every scraper tutorial ends with "remember to respect robots.txt and rate limits". Almost no code does.
-This library does it for you, and it will not let you forget:
+This does it for you, and it will not let you forget.
 
-```python
-from ethical_bot_fleet import Fleet, Blocked
+Free and open source (MIT). No accounts, no telemetry, nothing stored about you. Python 3.9+, no dependencies.
 
-fleet = Fleet(audit_log="audit.jsonl")
-bot = fleet.bot("AcmeResearchBot", contact="https://acme.example/bot", purpose="ai-input")
+## Start in one minute
 
-try:
-    page = bot.get("https://example.com/article")
-    print(page.text)
-except Blocked as no:
-    print("The fleet said no:", no)
+```bash
+pip install git+https://github.com/nickburum/The_Ethical_Bot_Fleet
 ```
 
+**1. No AI needed.** Read any public page as clean text, check a URL, or find dead links:
+
+```bash
+ebf read https://example.com/
+```
+
+```bash
+ebf check https://example.com/private/page
+```
+
+```bash
+ebf links README.md
+```
+
+**2. With an AI model on your own computer.** Nothing leaves your machine except the page requests:
+
+```bash
+ebf ask "What is this page about?" https://example.com/ --model ollama
+```
+
+**3. With a cloud model.** Set that provider's key in your environment, then pick it by name:
+
+```bash
+ebf ask "Summarise the pricing" https://example.com/pricing --model claude
+```
+
+`ebf models` shows every preset and which ones are ready on your machine:
+
+| Runs on your machine | Cloud |
+|---|---|
+| `ollama`, `lmstudio`, `llamacpp`, `vllm`, `jan` | `claude`, `openai`, `gemini`, `mistral`, `groq`, `deepseek`, `xai`, `openrouter`, `together` |
+
+Anything else that speaks the OpenAI-compatible API works with `--model custom --base-url http://host:port/v1`.
+Step-by-step setup for each one is in **[docs/MODELS.md](docs/MODELS.md)**.
+
+When a site says no, you see why, and so does the model:
+
 ```text
-$ ebf check --purpose ai-train https://example.com/ https://example.com/private/x
+$ ebf check https://example.com/ https://example.com/private/x
 ALLOW  https://example.com/
        ok: allowed by robots.txt
 BLOCK  https://example.com/private/x
@@ -32,36 +64,31 @@ BLOCK  https://example.com/private/x
        rule: Disallow: /private/ (line 2)
 ```
 
-Pure Python standard library. No dependencies. Python 3.9+.
+## Your privacy
 
-## Install
+- **No accounts, no sign-up, no telemetry.** The software never contacts its authors or anyone else on its own.
+- **Nothing is stored.** No config files, no history, no cache on disk. The one exception is the audit log, which exists only if you ask for it with `--audit-log` and stays on your machine.
+- **API keys stay in your environment.** They are read when needed, sent only to the provider you chose, and never written anywhere.
+- **You never give your name.** A bot always says it is a bot and gives a contact address, but that can be a project page or a shared mailbox. The command line uses a generic identity out of the box.
 
-```bash
-pip install git+https://github.com/nickburum/The_Ethical_Bot_Fleet
+What it does not do is disguise bots as people or hide them from the sites they visit. Details in [docs/PRIVACY.md](docs/PRIVACY.md).
+
+## In Python
+
+```python
+from ethical_bot_fleet import Fleet, Blocked, ask
+
+fleet = Fleet()
+bot = fleet.bot("AcmeResearchBot", contact="https://acme.example/bot", purpose="ai-input")
+
+try:
+    page = bot.get("https://example.com/article")
+    print(page.text)
+except Blocked as no:
+    print("The fleet said no:", no)
+
+print(ask(bot, "What is this about?", ["https://example.com/article"], model="ollama"))
 ```
-
-## Try it in ten seconds: find the dead links in your README
-
-```bash
-ebf links README.md
-```
-
-```text
-BROKEN   https://example.com/old-docs  (404)
-skipped       https://example.org/members  (robots_disallow)
-41 links: 39 ok, 1 broken, 1 skipped because the site said no
-```
-
-It exits non-zero when a link is broken, so it drops straight into CI, and it will not get your CI
-runner banned for hammering someone's server.
-
-## What people use it for
-
-- **Research agents.** An LLM that reads the web to answer questions, and only reads what it is allowed to.
-- **Search and RAG indexing.** Build an index of public docs while honouring `noai` and crawl delays.
-- **Dead-link and uptime checks.** For your docs, your awesome-list, or your own sites.
-- **Training-data collection with a paper trail.** Skip everything that opted out, and keep the log that proves it.
-- **Checking your own site.** `ebf check --purpose ai-train https://your.site/` shows what a well-behaved AI crawler would conclude from your robots.txt.
 
 ## What the fleet does for you
 
@@ -99,9 +126,9 @@ for result in searcher.crawl(urls, workers=32):
 
 Both bots share the same per-host budget, so adding bots never adds pressure on any one site.
 
-### Give it to your LLM agent
+### Give it to your own LLM agent
 
-Hand your agent `bot.get` as its only way to reach the web. Whatever URL the model comes up with, it
+`ask` covers the common case. If you already have an agent framework, hand it `bot.get` as its only way to reach the web. Whatever URL the model comes up with, it
 goes through the same checks, and a refusal comes back as a plain sentence the model can read:
 
 ```python
@@ -115,6 +142,18 @@ def fetch_tool(url: str) -> str:
 See [`examples/`](examples) for runnable scripts.
 
 ## Command line
+
+```bash
+ebf read https://example.com/page
+```
+
+```bash
+ebf ask "your question" https://example.com/page --model ollama
+```
+
+```bash
+ebf models
+```
 
 ```bash
 ebf check https://example.com/page

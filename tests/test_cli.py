@@ -61,13 +61,16 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             readme = os.path.join(folder, "README.md")
             with open(readme, "w") as handle:
-                handle.write("(see %s/wiki_(page)) and http://host:port/v1 and http://127.0.0.1:9/dead\n" % self.base)
+                handle.write("(see %s/wiki_(page)) and http://host:port/v1 and http://127.0.0.1:9/dead "
+                             "and https://example.com/sample and http://localhost:5000/v1\n" % self.base)
             code, out = self.run_cli("links", "-v", "--allow-private", "--delay", "0", readme)
             self.assertEqual(code, 1)
             self.assertIn("%s/wiki_(page)  (404)" % self.base, out)
             self.assertIn("BROKEN   http://host:port/v1", out)
             self.assertIn("BROKEN   http://127.0.0.1:9/dead", out)
             self.assertIn("3 links: 0 ok, 3 broken, 0 skipped", out)
+            self.assertIn("2 example addresses", out)
+            self.assertNotIn("example.com/sample", out)
 
     def test_bad_input_never_shows_a_traceback(self):
         with tempfile.TemporaryDirectory() as folder:

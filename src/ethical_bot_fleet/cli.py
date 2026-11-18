@@ -49,6 +49,18 @@ def _trim(link: str) -> str:
     return link
 
 
+_EXAMPLE_HOSTS = ("example.com", "example.org", "example.net", "example", "test", "invalid", "localhost")
+
+
+def _placeholder(link: str) -> bool:
+    """Addresses reserved for documentation, which are never meant to be real links."""
+    try:
+        host = (urlsplit(link).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == name or host.endswith("." + name) for name in _EXAMPLE_HOSTS)
+
+
 def _bot(args: argparse.Namespace, purpose: Optional[str] = None):
     policy = Policy(block_private_networks=not args.allow_private, min_delay=args.delay)
     return Fleet(policy, audit_log=args.audit_log).bot(args.agent, args.contact, purpose or args.purpose)
@@ -127,6 +139,8 @@ def _links(args: argparse.Namespace) -> int:
                 text = handle.read()
         urls += [_trim(match) for match in _LINK.findall(text)]
     urls = list(dict.fromkeys(urls))
+    examples = [link for link in urls if _placeholder(link)]
+    urls = [link for link in urls if not _placeholder(link)]
     broken = skipped = 0
     for result in bot.crawl(urls, workers=args.workers):
         if result.response is not None and result.response.status < 400:
@@ -144,6 +158,8 @@ def _links(args: argparse.Namespace) -> int:
             print("BROKEN   %s  (%s)" % (result.url, why))
     print("%d links: %d ok, %d broken, %d skipped because the site said no" % (
         len(urls), len(urls) - broken - skipped, broken, skipped))
+    if examples:
+        print("%d example addresses (such as example.com) were not checked" % len(examples))
     return 1 if broken else 0
 
 

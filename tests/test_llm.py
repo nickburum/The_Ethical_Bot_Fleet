@@ -113,6 +113,15 @@ class TextTests(unittest.TestCase):
         text = html_to_text(SITE["/"].decode())
         self.assertEqual(text, "Tea Shop\n\nWelcome\n\nWe sell oolong.")
 
+    def test_main_content_is_preferred_over_menus(self):
+        article = "<p>" + "The real article text. " * 12 + "</p>"
+        page = "<body><nav><a>Home</a></nav><div>Jump to content</div><main>%s</main><footer>Legal</footer></body>" % article
+        text = html_to_text(page)
+        self.assertTrue(text.startswith("The real article text."))
+        for clutter in ("Home", "Jump to content", "Legal"):
+            self.assertNotIn(clutter, text)
+        self.assertIn("Legal", html_to_text("<main><p>tiny</p></main><footer>Legal</footer>"))  # too little: keep all
+
     def test_unclosed_head_and_table_cells(self):
         self.assertEqual(html_to_text("<html><head><title>T</title><body><p>BODY</p>"), "T\n\nBODY")
         self.assertEqual(html_to_text("<table><tr><td>Basic</td><td>$5/month</td></tr></table>"), "Basic $5/month")

@@ -59,6 +59,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.end_headers()
         if self.path == "/echo/v1/chat/completions":
             return self._send(401, {"error": "bad key: " + self.headers.get("Authorization", "")})
+        if self.path == "/textcall/v1/chat/completions":
+            last = body["messages"][-1]
+            if last["role"] == "user" and "Result of fetch_page" in last["content"]:
+                return self._send(200, {"choices": [{"message": {"role": "assistant", "content": "GOT: " + last["content"]}}]})
+            call = '<tool_call>\n{"name": "fetch_page", "arguments": {"url": "%s/more"}}\n</tool_call>' % base
+            if "sloppy" in body["messages"][1]["content"]:  # brackets doubled, as a small real model did
+                call = '<tool_call>\n{{"name": "fetch_page", "arguments": {"url": "%s/more"}}}}\n</tool_call>' % base
+            if "garbled" in body["messages"][1]["content"]:
+                call = "<tool_call>???</tool_call>"
+            return self._send(200, {"choices": [{"message": {"role": "assistant", "content": call}}]})
         if self.path == "/odd/v1/chat/completions":
             return self._send(200, {"choices": [{"message": Handler.odd}]})
         if self.path == "/v1/chat/completions":
@@ -152,6 +162,29 @@ class AskTests(Base):
         path, headers, body = Handler.chats[0]
         self.assertEqual(headers["Authorization"], "Bearer sk-test-secret")
         self.assertNotIn("sk-test-secret", json.dumps(body))
+
+    def test_tool_call_written_as_text_is_still_run(self):
+        events = []
+        answer = ask(self.bot, "When are they open?", model="custom:m", base_url=self.base + "/textcall/v1",
+                     on_event=events.append)
+        self.assertIn("Opening hours: 9 to 5.", answer)
+        self.assertNotIn("<tool_call>", answer)
+        self.assertIn("reading %s/more" % self.base, events)
+        sloppy = ask(self.bot, "sloppy: when are they open?", model="custom:m", base_url=self.base + "/textcall/v1")
+        self.assertIn("Opening hours: 9 to 5.", sloppy)
+        with self.assertRaises(LLMError):
+            ask(self.bot, "garbled", model="custom:m", base_url=self.base + "/textcall/v1")
+
+    def test_urls_in_the_question_are_read_up_front(self):
+        Handler.tools_supported = False
+        answer = ask(self.bot, "What does %s/ sell?" % self.base, model="ollama", base_url=self.base + "/v1")
+        self.assertIn("We sell oolong.", answer)
+
+    def test_answer_without_reading_is_flagged(self):
+        Handler.tools_supported = False
+        events = []
+        ask(self.bot, "What is tea?", model="ollama", base_url=self.base + "/v1", on_event=events.append)
+        self.assertTrue(any("without reading any page" in event for event in events))
 
     def test_key_never_follows_a_redirect(self):
         with mock.patch.dict(os.environ, {"EBF_API_KEY": "sk-test-secret"}):

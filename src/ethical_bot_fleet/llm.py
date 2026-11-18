@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -24,7 +25,8 @@ SYSTEM = (
     "You answer questions using public web pages. Pages the user supplied are included in the "
     "message. Use the fetch_page tool to read any other page you need. If a page cannot be "
     "fetched the tool says why: respect that, do not retry it, and say so in your answer. "
-    "Base your answer on what the pages say and name the URLs you used."
+    "Base your answer on what the pages say and name the URLs you used. Never describe a page "
+    "whose text is not in this conversation; if you have not read it, say so."
 )
 
 TOOL = {
@@ -166,6 +168,33 @@ def list_models(base_url: str, key: str = "", timeout: float = 5.0) -> List[str]
     return [str(item["id"]) for item in items if isinstance(item, dict) and item.get("id")]
 
 
+_TEXT_CALL = re.compile(r"<tool_call>(.*?)(?:</tool_call>|\Z)", re.S)
+_URL = re.compile(r"https?://[^\s<>\"'`\])}]+")
+
+
+def _text_calls(content: str) -> List[Dict[str, Any]]:
+    """Tool calls that a local model wrote out as text instead of sending them properly."""
+    found = []
+    for block in _TEXT_CALL.findall(content):
+        try:
+            call = json.loads(block)
+        except ValueError:
+            # Small models often get the brackets wrong; the intent is still plain to see.
+            address = _URL.search(block)
+            if "fetch_page" in block and address:
+                found.append({"name": "fetch_page", "arguments": {"url": address.group(0).rstrip('.,;:!?\\')}})
+            continue
+        if isinstance(call, dict) and call.get("name"):
+            arguments = call.get("arguments", call.get("parameters", {}))
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    arguments = {}
+            found.append({"name": str(call["name"]), "arguments": arguments if isinstance(arguments, dict) else {}})
+    return found
+
+
 def _openai_run(base: str, key: str, model: str, system: str, question: str,
                 call_tool: Callable[[str, Dict[str, Any]], str], max_steps: int) -> str:
     messages: List[Dict[str, Any]] = [{"role": "system", "content": system}, {"role": "user", "content": question}]
@@ -200,6 +229,17 @@ def _openai_run(base: str, key: str, model: str, system: str, question: str,
             if isinstance(content, list):  # some servers send the answer as a list of text parts
                 content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
             answer = content.strip() if isinstance(content, str) else ""
+            written = _text_calls(answer) if use_tools else []
+            if written:  # many local models ask for a tool this way; run it and hand the result back
+                messages.append({"role": "assistant", "content": answer})
+                results = ["Result of %s(%s):\n%s" % (
+                    call["name"], call["arguments"].get("url", ""), call_tool(call["name"], call["arguments"]),
+                ) for call in written]
+                messages.append({"role": "user", "content": "\n\n".join(results) + "\n\nNow answer the question."})
+                continue
+            if "<tool_call>" in answer:
+                raise LLMError("The model tried to use the page-reading tool in a form that could not be understood. "
+                               "Put the page address in your question or on the command line instead.")
             if not answer:
                 raise LLMError("The model returned an empty answer.")
             return answer
@@ -274,7 +314,10 @@ def ask(bot: Bot, question: str, urls: Iterable[str] = (), model: Optional[str] 
             return "Unknown tool call. The only tool is fetch_page(url)."
         return read(url)
 
+    reads: List[str] = []
+
     def read(url: str) -> str:
+        reads.append(url)
         notify("reading " + url)
         text = fetch_text(bot, url)
         if text.startswith(("Not fetched:", "The request failed:", "The server answered")):
@@ -286,18 +329,25 @@ def ask(bot: Bot, question: str, urls: Iterable[str] = (), model: Optional[str] 
 
         claude.preflight()  # fail before reading any page if Claude cannot run
 
+    # Pages named in the question are read up front too, so the answer never depends on the model
+    # choosing to use the tool.
+    wanted = list(dict.fromkeys(list(urls) + [found.rstrip(".,;:!?") for found in _URL.findall(question)]))
     parts = [question]
-    for url in urls:
+    for url in wanted:
         parts.append("Page %s:\n%s" % (url, read(url)))
     prompt = "\n\n".join(parts)
     notify("asking %s (%s)%s" % (preset.label, model_name, " at " + base if moved else ""))
 
     try:
         if preset.kind == "claude":
-            return claude.run(model_name, SYSTEM, prompt, TOOL, call_tool, max_steps)
-        return _openai_run(base, key, model_name, SYSTEM, prompt, call_tool, max_steps)
+            answer = claude.run(model_name, SYSTEM, prompt, TOOL, call_tool, max_steps)
+        else:
+            answer = _openai_run(base, key, model_name, SYSTEM, prompt, call_tool, max_steps)
     except (AttributeError, KeyError, IndexError, TypeError):
         raise LLMError("The model server sent a reply this tool does not understand.") from None
+    if not reads:
+        notify("note: the model answered without reading any page, so treat the answer as its own knowledge")
+    return answer
 
 
 def status() -> List[Tuple[str, Preset, bool, str]]:

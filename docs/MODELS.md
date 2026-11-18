@@ -73,10 +73,20 @@ only; it never redirects a cloud preset.
 
 A model on this machine (`localhost`) is always contacted directly, even if your system uses a proxy.
 
-### Models that cannot use tools
+### Small models and tools
 
-Some small local models cannot call tools. That is fine: `ebf` notices, and the model answers from the
-pages you listed on the command line. It just cannot ask for more pages on its own.
+Small local models are often unreliable at asking for pages themselves. `ebf` is built so that this does
+not matter:
+
+- Any address you put on the command line **or inside your question** is read up front and handed to the
+  model, so the answer never depends on the model deciding to use a tool.
+- If a model writes its tool request out as text (a `<tool_call>` block) instead of sending it properly,
+  `ebf` understands that and runs it, even when the brackets are slightly wrong.
+- If a model cannot use tools at all, it answers from the pages you supplied.
+- If the model answered without any page being read, `ebf` says so, because that answer is the model's own
+  knowledge and may be made up.
+
+Expect a small model on a laptop CPU to take a minute or two on a long page.
 
 ## A cloud model
 
@@ -142,6 +152,16 @@ from ethical_bot_fleet import Fleet, ask
 bot = Fleet().bot("AcmeReaderBot", contact="https://acme.example/bot", purpose="ai-input")
 print(ask(bot, "What is this page about?", ["https://example.com/"], model="ollama"))
 ```
+
+## What has actually been tested
+
+| Setup | Status |
+|---|---|
+| llama.cpp server (`llama-cpp-python` 0.3.37) with Qwen2.5-1.5B-Instruct, on CPU | Tested end to end against real websites |
+| Claude, through Anthropic's SDK | Request format tested against a stand-in server; not yet run with a real key |
+| Ollama, LM Studio, vLLM, Jan, and the other cloud providers | They speak the same protocol as the tested server, but have not been run with the real apps yet |
+
+If you try one of the untested rows, please open an issue saying how it went.
 
 ## Troubleshooting
 
